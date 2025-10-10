@@ -1,0 +1,345 @@
+---
+title: "Regression"
+author: "Bryan Chang"
+date: "2025-10-10"
+output: html_document
+---
+
+```{r}
+start <- Sys.time()
+```
+
+```{r, warning=FALSE, message=FALSE}
+library(tidyverse)
+```
+
+In this document we perform a statistical test on worm gcamp time series to determine if a response occurs. We fit a linear model $y=\beta_0+\beta_1 t$ and alternative model $y=\beta_0+\beta_1 t+\beta_2 t_++\beta_3 \mathbb{1}(t>0)$ and define our $H_0$ as $\beta_2=0$ and $\beta_3=0$.
+
+I use Jacob's code to load stimulation data.
+
+## Preparing stimulations data
+
+Let's get all the worm indices and then for each worm extract the relevant information about stimulation events:
+
+```{r}
+worm_indices <- fs::dir_ls(path = "../exported_data") %>%
+  str_subset("stim_neurons.txt") %>% 
+  str_extract("(\\d+)_stim", group = 1) %>% 
+  as.numeric() %>% 
+  sort()
+stopifnot(all(worm_indices == seq(0, length(worm_indices)-1)))
+stims <- worm_indices %>% 
+  map(~ {
+    stim_neuron_file <- str_glue("../exported_data/{.x}_stim_neurons.txt")
+    labels_file <- str_glue("../exported_data/{.x}_labels.txt")
+    vols_file <- str_glue("../exported_data/{.x}_stim_volume_i.txt")
+    labels <- readLines(labels_file)
+    dat <- tibble(
+      vol = as.numeric(readLines(vols_file)) + 1, # convert from 0 indexing
+      neuron_indices = as.numeric(readLines(stim_neuron_file))
+    ) %>% 
+      mutate(
+        neuron_indices = if_else(neuron_indices < 0,
+                                 neuron_indices,
+                                 neuron_indices + 1) # convert from 0 indexing w/o affecting negatives
+        )
+    dat$neuron <- rep(NA, nrow(dat))
+    ii <- dat$neuron_indices
+    dat$neuron[ii > 0] <- labels[ii[ii > 0]]
+    return(dat)
+  })
+names(stims) <- worm_indices
+```
+
+Let's create a data frame with all stimulation events:
+
+```{r}
+stim_events <- stims %>% 
+  bind_rows(.id = "worm")
+```
+
+Let's see how many stimulations events there are per worm:
+
+```{r}
+stim_events %>% 
+  filter(neuron_indices > -2) %>% 
+  count(worm,sort=TRUE) %>%
+  ggplot(aes(x = n)) + 
+  geom_histogram() +
+  labs(title="How many times is a worm stimulated?",
+       subtitle="(neuron_id > -2)")
+```
+
+Let's make a feature that records the number of stimulations have occurred prior to the current one for this worm:
+
+```{r}
+stim_events <- stim_events %>% 
+  group_by(worm) %>% 
+  mutate(rank = rank(vol) - 1) %>% 
+  ungroup()
+```
+
+## Preparing gcamp data
+
+Next, we load the gcamp data for all the worms:
+
+```{r, message=FALSE}
+gcamps <- worm_indices %>% map(~ {
+  gcamp <- read_delim(str_glue("../exported_data/{.x}_gcamp.txt"),
+                      delim = " ", col_names = FALSE)
+  times <- readr::read_csv(str_glue("../exported_data/{.x}_t.txt"),
+                           col_names = FALSE)[[1]]
+  labels <- readLines(str_glue("../exported_data/{.x}_labels.txt"))
+  ii_nolabels <- which(labels %in% c("", " "))
+  labels[ii_nolabels] <- str_glue("w{.x}_{ii_nolabels}")
+  if (ncol(gcamp) != length(labels)) {
+    cat(str_glue(
+      "Worm {.x} has {length(labels)} labels but {ncol(gcamp)} gcamp columns."
+      ), fill=TRUE)
+    return(NA)
+  }
+  gcamp <- as.matrix(gcamp)
+  rownames(gcamp) <- times
+  colnames(gcamp) <- labels
+  gcamp
+})
+names(gcamps) <- worm_indices
+ii_na <- worm_indices %>%
+  as.character() %>%
+  map_lgl(~ all(is.na(gcamps[[.x]]))) %>% 
+  which()
+gcamps <- gcamps[-ii_na]
+worm_indices <- worm_indices[-ii_na]
+stim_events <- stim_events %>% 
+  filter(worm %in% worm_indices)
+
+```
+
+Let's look for parts of the recording where linear interpolation appears to have taken place and let's set those to NA.
+
+```{r}
+gcamps <- gcamps %>% 
+  map(~ {
+    is_linear <- abs(apply(.x, 2, diff, differences = 2)) < 1e-5
+    is_linear <- rbind(FALSE, is_linear, FALSE) # second diff'ing only for middle pts
+    .x[is_linear] <- NA
+    return(.x)
+  })
+```
+
+
+Now, sometimes the same neuron label appears more than once within a worm.  This is because sometimes a neuron gets split into two spatially separated segments:
+
+```{r}
+worm_indices %>%
+  as.character() %>%
+  map_dfr(~ {
+    if (all(is.na(gcamps[[.x]]))) return()
+    gcamps[[.x]] %>%
+      colnames() %>% 
+      table() %>% 
+      as_tibble() %>%
+      set_names(c("neuron", "n")) %>%
+      filter(n > 1) %>% 
+      mutate(worm = .x)
+    }) %>% 
+  arrange(-n)
+```
+
+For now let's remove the "merge" and "target" neurons, but we might change our mind once Andy/Sophie look into this more.
+
+Let's average the gcamps for repeated neurons:
+
+```{r}
+gcamps <- worm_indices %>%
+  as.character() %>%
+  map(~ {
+    ii_keep <- which(!(colnames(gcamps[[.x]]) %in% c("merge", "target")))
+    gcamps[[.x]] <- gcamps[[.x]][, ii_keep]
+    repeated <- gcamps[[.x]] %>%
+      colnames() %>% 
+      table() %>% 
+      as_tibble() %>%
+      set_names(c("neuron", "n")) %>%
+      filter(n > 1) %>% 
+      mutate(worm = .x) %>% 
+      pull(neuron)
+    for (neur in repeated) {
+      ii <- which(colnames(gcamps[[.x]]) == neur) # all repeated columns
+      gcamps[[.x]][, ii[1]] <- rowMeans(gcamps[[.x]][, ii]) # put avg in first
+      gcamps[[.x]] <- gcamps[[.x]][, -ii[-1]] # remove all but first
+    }
+    return(gcamps[[.x]])
+  }) %>% 
+  set_names(worm_indices)
+```
+
+Let's also remove any neurons that are consistently NaN:
+
+```{r}
+gcamps2 <- gcamps %>%
+  map(~ {
+    ii_keep <- which(colSums(is.na(.x)) < nrow(.x))
+    .x[, ii_keep]
+  })
+```
+
+
+## Defining whether a response occurred
+
+We need some way to define whether a response occurred. There are many ways to define this. Let's start simple. We will treat this as a one-sided, two-sample test, in which we compare the gcamp in the ~10 seconds before a stimulation to the ~30 seconds after. Let's work this out in an example:
+
+```{r}
+#' Plots the gcamp response to a stimulation
+#' 
+#' Plots the time series of a neuron's gcamp before and after a stimulation.
+#' 
+#' @param worm_ind The worm index (character)
+#' @param vol The volume number of the stimulation
+#' @param neuron The neuron label whose response we want to plot
+#' @param sec_before The number of seconds before the stimulation to plot
+#' @param sec_after The number of seconds after the stimulation to plot
+#' 
+#' @return A ggplot object
+plot_stim_response <- function(worm_ind, vol, neuron, sec_before = 30, sec_after = 30) {
+  before <- seq(2 * sec_before)
+  after <- 2 * sec_before + seq(2, 2 * sec_after + 1)
+  vols <- seq(vol - 2 * sec_before, vol + 2 * sec_after)
+  gc <- gcamps[[worm_ind]][vols, neuron]
+  tibble(times = seq(-sec_before, sec_after, length = length(vols)), gc = gc) %>%
+    ggplot(aes(x = times, y = gc)) + 
+    geom_line() +
+    geom_point() +
+    geom_vline(xintercept = 0) +
+    geom_segment(aes(x = -sec_before,
+                     xend = -0.5,
+                     y = mean(gc[before]),
+                     yend = mean(gc[before]))) +
+    geom_segment(aes(x = 0.5,
+                     xend = sec_after,
+                     y = mean(gc[after]),
+                     yend = mean(gc[after]))) +
+    labs(x = "Time since stimulation (s)",
+         y = "raw gcamp",
+         title = str_glue("Worm {worm_ind}, neuron {neuron} response to vol {vol}"))
+}
+```
+
+```{r}
+plot_stim_response("0", 102, "w0_1")
+```
+
+
+
+Let's do a two sample test to see if the mean gcamp is higher after the stimulation than before:
+
+```{r}
+w <- stim_events$worm[2]
+vol <- stim_events$vol[2]
+neuron <- colnames(gcamps[[w]])[1]
+sec_before <- 10; sec_after <- 30
+before <- seq(2 * sec_before)
+after <- 2 * sec_before + seq(2, 2 * sec_after + 1)
+vols <- seq(vol - 2 * sec_before, vol + 2 * sec_after)
+gc <- gcamps[[w]][vols, neuron]
+```
+
+```{r}
+t.test(gc[before], gc[after], alternative = "less")
+```
+
+This might be ok in this case, but we could also consider a non-parametric test (that doesn't assume normality and can work with small sample sizes):
+
+```{r}
+wilcox.test(gc[before], gc[after], alternative = "less")
+```
+Now let's repeat this for each column of `gcamps[[w]][vols, ]` and get a vector of p-values:
+
+```{r}
+pvals <- apply(gcamps[[w]][vols, ], 2, function(x) wilcox.test(x[before],
+                                              x[after],
+                                              alternative = "less")$p.value)
+```
+
+Now let's repeat the above for each worm-vol pair appearing in the `stim_events` data frame:
+
+```{r}
+stim_events <- stim_events %>% 
+  mutate(pvals = map2(worm, vol, ~ {
+    worm_ind <- .x
+    vol <- .y
+    vols <- seq(vol - 20, vol + 60)
+    
+    if (all(is.na(gcamps[[worm_ind]]))) {
+        cat(str_glue("Worm {worm_ind} is NA."), fill = TRUE)
+        return(NA)
+    }
+    if (max(vols) > nrow(gcamps[[worm_ind]])) {
+      cat(str_glue("Skip: Stim in last 30 seconds of recording."),
+          fill = TRUE)
+      return(NA)
+    }
+    
+    gc <- gcamps[[worm_ind]][vols, ]
+    list(apply(gc, 2, function(x) {
+      if (any(is.na(x))) return(NA)
+      wilcox.test(x[1:20], x[22:81], alternative = "less")$p.value
+    }))
+  }))
+```
+
+```{r}
+stim_events1 <- stim_events %>% filter(!is.na(pvals))
+pvals <- stim_events1 %>% 
+  pull(pvals) %>% 
+  map(~ enframe(.x[[1]])) %>% 
+  bind_rows(.id = "stim") %>% 
+  pivot_wider(id_cols = stim, names_from = name, values_from = value)
+```
+
+Let's look at some plots for the smallest p-values:
+
+```{r}
+pval_mat <- pvals %>% 
+  select(-stim) %>%
+  as.matrix()
+```
+
+```{r}
+imin <- which(pval_mat <= sort(pval_mat)[5], arr.ind = TRUE)
+imax <- which(pval_mat >= sort(pval_mat, decreasing = TRUE)[5], arr.ind = TRUE)
+```
+
+The biggest responses:
+
+```{r}
+for (i in 1:nrow(imin)) {
+  g <- plot_stim_response(stim_events1$worm[imin[i, 1]],
+                          stim_events1$vol[imin[i, 1]],
+                          colnames(pval_mat)[imin[i, 2]])
+  print(g)
+}
+```
+All of these are tied with the smallest possible p-value, corresponding to the case where all of the before values are below all of the after values.
+
+```{r}
+for (i in 1:nrow(imax)) {
+  g <- plot_stim_response(stim_events1$worm[imax[i, 1]],
+                          stim_events1$vol[imax[i, 1]],
+                          colnames(pval_mat)[imax[i, 2]],
+                          sec_before = 20)
+  print(g)
+}
+```
+
+## Null Model
+
+```{r}
+
+```
+
+## Alternative Model
+
+```{r}
+
+```

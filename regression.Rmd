@@ -332,14 +332,196 @@ for (i in 1:nrow(imax)) {
 }
 ```
 
-## Null Model
+## Linear Spline Model
+
+```{r}
+stim_events <- stim_events %>% 
+  mutate(pvals_lm_10sb_30sa = map2(worm, vol, ~ {
+    worm_ind <- .x
+    vol <- .y
+    vols <- seq(vol - 20, vol + 60)
+    
+    if (all(is.na(gcamps[[worm_ind]]))) {
+        cat(str_glue("Worm {worm_ind} is NA."), fill = TRUE)
+        return(NA)
+    }
+    if (max(vols) > nrow(gcamps[[worm_ind]])) {
+      cat(str_glue("Skip: Stim in last 30 seconds of recording."),
+          fill = TRUE)
+      return(NA)
+    }
+    
+    gc <- gcamps[[worm_ind]][vols, ]
+    
+    # Create time vector: -20 to 60 (centered at stimulus)
+    time <- seq(-20, 60)
+    
+    list(apply(gc, 2, function(x) {
+      if (any(is.na(x))) return(NA)
+      
+      # Fit null model: y ~ time
+      model_null <- lm(x ~ time)
+      
+      # Fit alternative model: y ~ time + pmax(time, 0) + I(time > 0)
+      model_alt <- lm(x ~ time + pmax(time, 0) + I(time > 0))
+      
+      # F-test comparing nested models
+      f_test <- anova(model_null, model_alt)
+      
+      # Return p-value
+      f_test$`Pr(>F)`[2]
+    }))
+  }))
+```
+
+Adjust for multiple hypothesis testing with Benjamini-Hochberg:
+
+```{r}
+stim_events <- stim_events %>%
+  mutate(pvals_lm_10sb_30sa_adj = map(pvals_lm_10sb_30sa, ~ {
+    if (is.na(.x)) return(NA)
+    
+    pvals <- .x[[1]]
+    pvals_corrected <- p.adjust(pvals, method = "BH")
+    list(pvals_corrected)
+  }))
+```
+
+```{r}
+stim_events1 <- stim_events %>% filter(!is.na(pvals_lm_10sb_30sa_adj))
+pvals_lm_10sb_30sa_adj <- stim_events1 %>% 
+  pull(pvals_lm_10sb_30sa_adj) %>% 
+  map(~ enframe(.x[[1]])) %>% 
+  bind_rows(.id = "stim") %>% 
+  pivot_wider(id_cols = stim, names_from = name, values_from = value)
+```
+
+```{r}
+pval_mat <- pvals_lm_10sb_30sa_adj %>% 
+  select(-stim) %>%
+  as.matrix()
+```
+
+Look at distribution of p-values.
+
+```{r}
+ggplot(data.frame(pval = na.omit(as.vector(pval_mat))), aes(x = pval)) +
+  geom_histogram(bins = 50, fill = "lightblue", color = "white") +
+  # scale_y_log10() +
+  geom_vline(xintercept = 0.05, linetype = "dashed", color = "red") +
+  labs(title = "Distribution of P-values (log scale)",
+       x = "P-value",
+       y = "Count") +
+  theme_minimal()
+```
+
+
+Let's filter and plot gcamp data for different p-vals:
+
+```{r}
+imin <- which(pval_mat <= sort(pval_mat)[5], arr.ind = TRUE)
+imax <- which(pval_mat >= sort(pval_mat, decreasing = TRUE)[5], arr.ind = TRUE)
+```
+
+Lowest p-vals:
+
+```{r}
+for (i in 1:nrow(imin)) {
+  g <- plot_stim_response(stim_events1$worm[imin[i, 1]],
+                          stim_events1$vol[imin[i, 1]],
+                          colnames(pval_mat)[imin[i, 2]])
+  print(g)
+}
+```
+
+Highest p-vals:
+
+```{r}
+for (i in 1:nrow(imax)) {
+  g <- plot_stim_response(stim_events1$worm[imax[i, 1]],
+                          stim_events1$vol[imax[i, 1]],
+                          colnames(pval_mat)[imax[i, 2]],
+                          sec_before = 20)
+  print(g)
+}
+```
+##
+
+```{r}
+load("gt-table.Rdata")
+```
 
 ```{r}
 
+# Unnest predictions
+predictions <- stim_events %>%
+  filter(!is.na(pvals_lm_10sb_30sa_adj)) %>%
+  mutate(
+    neuron_results = map(pvals_lm_10sb_30sa_adj, ~ {
+      pvals <- .x[[1]]
+      data.frame(
+        recorded_neuron = names(pvals),
+        pval_adj = as.numeric(pvals)
+      )
+    })
+  ) %>%
+  select(worm, vol, neuron_results) %>%
+  unnest(neuron_results) %>%
+  filter(!is.na(pval_adj))
+
+# Join with ground truth
+eval_data <- predictions %>%
+  inner_join(gt_table, by = c("worm", "vol", "recorded_neuron")) %>%
+  mutate(
+    # Ground truth: TRUE if should reject null (label != 0)
+    gt_positive = label != 0
+  )
+
+# Evaluate at multiple thresholds
+thresholds <- 10^seq(-30, -1)
+
+results <- map_dfr(thresholds, function(thresh) {
+  eval_data %>%
+    mutate(
+      predicted_positive = pval_adj < thresh,
+      TP = predicted_positive & gt_positive,
+      FP = predicted_positive & !gt_positive,
+      TN = !predicted_positive & !gt_positive,
+      FN = !predicted_positive & gt_positive
+    ) %>%
+    summarise(
+      threshold = thresh,
+      TP = sum(TP),
+      FP = sum(FP),
+      TN = sum(TN),
+      FN = sum(FN),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      sensitivity = TP / (TP + FN),  # True Positive Rate / Recall
+      specificity = TN / (TN + FP),  # True Negative Rate
+      precision = TP / (TP + FP),    # Positive Predictive Value
+      accuracy = (TP + TN) / (TP + FP + TN + FN),
+      f1_score = 2 * (precision * sensitivity) / (precision + sensitivity)
+    )
+})
+
+# Visualize performance across thresholds
+results %>%
+  select(threshold, sensitivity, specificity, precision, accuracy, f1_score) %>%
+  pivot_longer(-threshold, names_to = "metric", values_to = "value") %>%
+  ggplot(aes(x = threshold, y = value, color = metric)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  scale_x_log10(breaks = thresholds) +
+  labs(title = "Performance Metrics vs FDR Threshold",
+       x = "FDR Threshold",
+       y = "Value",
+       color = "Metric") +
+  theme_minimal() +
+  ylim(0, 1) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
 ```
 
-## Alternative Model
 
-```{r}
 
-```

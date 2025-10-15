@@ -6,3 +6,4 @@
 *.Rdata
 
 /regression_files
+*.html

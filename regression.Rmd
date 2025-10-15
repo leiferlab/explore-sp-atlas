@@ -838,3 +838,62 @@ results %>%
   theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
 ```
 
+## Eval
+
+```{r}
+imin <- which(pval_mat <= sort(pval_mat)[100], arr.ind = TRUE)
+imax <- which(pval_mat >= sort(pval_mat, decreasing = TRUE)[100], arr.ind = TRUE)
+```
+
+Lowest p-vals:
+
+```{r warning=FALSE}
+for (i in 1:nrow(imin)) {
+  g <- plot_stim_response(stim_events1$worm[imin[i, 1]],
+                          stim_events1$vol[imin[i, 1]],
+                          colnames(pval_mat)[imin[i, 2]], sec_before = 10)
+  print(g)
+}
+```
+worm 34, neuron w34_51 response to vol 3305
+worm 10, neuron urx response to vol 2764
+worm 90, neuron ribl response to vol 1705
+worm 12, neuron avel response to vol 1298
+
+
+Highest p-vals:
+
+```{r warning=FALSE}
+for (i in 1:nrow(imax)) {
+  g <- plot_stim_response(stim_events1$worm[imax[i, 1]],
+                          stim_events1$vol[imax[i, 1]],
+                          colnames(pval_mat)[imax[i, 2]],
+                          sec_before = 20)
+  print(g)
+}
+```
+
+
+p-vals close to target:
+```{r warning=FALSE}
+target_p <- 0.00001     # The p-value you want to center around
+n_to_plot <- 20      # How many responses to plot
+
+# Compute absolute distance from the target p-value
+dist_from_target <- abs(pval_mat - target_p)
+
+# Find indices of the n smallest distances
+imin <- which(dist_from_target <= sort(dist_from_target)[n_to_plot], arr.ind = TRUE)
+
+# Plot each
+for (i in seq_len(nrow(imin))) {
+  g <- plot_stim_response(
+    stim_events1$worm[imin[i, 1]],
+    stim_events1$vol[imin[i, 1]],
+    colnames(pval_mat)[imin[i, 2]],
+    sec_before = 10
+  )
+  print(g)
+}
+```
+

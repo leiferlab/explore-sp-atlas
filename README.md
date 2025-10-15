@@ -1,5 +1,9 @@
 # explore-sp-atlas
 
+## Setup
+
+Download exported_data and raw_extracted_data from [https://osf.io/e2syt/](https://osf.io/e2syt/) and put both into the parent directory above explore-sp-atlas.
+
 ## Updates
 
 ### 10/10

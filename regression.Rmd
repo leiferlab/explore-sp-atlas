@@ -58,7 +58,7 @@ stim_events <- stims %>%
   bind_rows(.id = "worm")
 ```
 
-Let's see how many stimulations events there are per worm:
+Let's see how many stimulation events there are per worm:
 
 ```{r}
 stim_events %>% 
@@ -409,7 +409,7 @@ ggplot(data.frame(pval = na.omit(as.vector(pval_mat))), aes(x = pval)) +
   geom_histogram(bins = 50, fill = "lightblue", color = "white") +
   # scale_y_log10() +
   geom_vline(xintercept = 0.05, linetype = "dashed", color = "red") +
-  labs(title = "Distribution of P-values (log scale)",
+  labs(title = "Distribution of P-values",
        x = "P-value",
        y = "Count") +
   theme_minimal()
@@ -445,7 +445,6 @@ for (i in 1:nrow(imax)) {
   print(g)
 }
 ```
-##
 
 ```{r}
 load("gt-table.Rdata")
@@ -523,5 +522,319 @@ results %>%
   theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
 ```
 
+## Using raw data
 
+We saw that many of our highest p-vals were from interpolated data. Let's work with the raw data and exclude time series with $k\ge2$ consecutive NaNs.
+
+```{r}
+worm_indices <- fs::dir_ls(path = "../raw_extracted_data") %>%
+  str_subset("stim_neurons.txt") %>% 
+  str_extract("(\\d+)_stim", group = 1) %>% 
+  as.numeric() %>% 
+  sort()
+stopifnot(all(worm_indices == seq(0, length(worm_indices)-1)))
+stims <- worm_indices %>% 
+  map(~ {
+    stim_neuron_file <- str_glue("../raw_extracted_data/{.x}_stim_neurons.txt")
+    labels_file <- str_glue("../raw_extracted_data/{.x}_labels.txt")
+    vols_file <- str_glue("../raw_extracted_data/{.x}_stim_volume_i.txt")
+    labels <- readLines(labels_file)
+    dat <- tibble(
+      vol = as.numeric(readLines(vols_file)) + 1, # convert from 0 indexing
+      neuron_indices = as.numeric(readLines(stim_neuron_file))
+    ) %>% 
+      mutate(
+        neuron_indices = if_else(neuron_indices < 0,
+                                 neuron_indices,
+                                 neuron_indices + 1) # convert from 0 indexing w/o affecting negatives
+        )
+    dat$neuron <- rep(NA, nrow(dat))
+    ii <- dat$neuron_indices
+    dat$neuron[ii > 0] <- labels[ii[ii > 0]]
+    return(dat)
+  })
+names(stims) <- worm_indices
+```
+
+Let's create a data frame with all stimulation events:
+
+```{r}
+stim_events <- stims %>% 
+  bind_rows(.id = "worm")
+```
+
+Let's see how many stimulation events there are per worm:
+
+```{r}
+stim_events %>% 
+  filter(neuron_indices > -2) %>% 
+  count(worm,sort=TRUE) %>%
+  ggplot(aes(x = n)) + 
+  geom_histogram() +
+  labs(title="How many times is a worm stimulated?",
+       subtitle="(neuron_id > -2)")
+```
+Next, we load the gcamp data for all the worms:
+
+```{r, message=FALSE}
+gcamps <- worm_indices %>% map(~ {
+  gcamp <- read_delim(str_glue("../raw_extracted_data/{.x}_gcamp.txt"),
+                      delim = " ", col_names = FALSE)
+  times <- readr::read_csv(str_glue("../raw_extracted_data/{.x}_t.txt"),
+                           col_names = FALSE)[[1]]
+  labels <- readLines(str_glue("../raw_extracted_data/{.x}_labels.txt"))
+  ii_nolabels <- which(labels %in% c("", " "))
+  labels[ii_nolabels] <- str_glue("w{.x}_{ii_nolabels}")
+  if (ncol(gcamp) != length(labels)) {
+    cat(str_glue(
+      "Worm {.x} has {length(labels)} labels but {ncol(gcamp)} gcamp columns."
+      ), fill=TRUE)
+    return(NA)
+  }
+  gcamp <- as.matrix(gcamp)
+  rownames(gcamp) <- times
+  colnames(gcamp) <- labels
+  gcamp
+})
+names(gcamps) <- worm_indices
+# ii_na <- worm_indices %>%
+#   as.character() %>%
+#   map_lgl(~ all(is.na(gcamps[[.x]]))) %>%
+#   which()
+# gcamps <- gcamps[-ii_na]
+# worm_indices <- worm_indices[-ii_na]
+stim_events <- stim_events %>%
+  filter(worm %in% worm_indices)
+
+```
+
+```{r}
+gcamps <- worm_indices %>%
+  as.character() %>%
+  map(~ {
+    ii_keep <- which(!str_detect(colnames(gcamps[[.x]]), "^merge|^target")) # merge.1 is also merge
+    gcamps[[.x]] <- gcamps[[.x]][, ii_keep]
+    repeated <- gcamps[[.x]] %>%
+      colnames() %>% 
+      table() %>% 
+      as_tibble() %>%
+      set_names(c("neuron", "n")) %>%
+      filter(n > 1) %>% 
+      mutate(worm = .x) %>% 
+      pull(neuron)
+    for (neur in repeated) {
+      ii <- which(colnames(gcamps[[.x]]) == neur) # all repeated columns
+      gcamps[[.x]][, ii[1]] <- rowMeans(gcamps[[.x]][, ii]) # put avg in first
+      gcamps[[.x]] <- gcamps[[.x]][, -ii[-1]] # remove all but first
+    }
+    return(gcamps[[.x]])
+  }) %>% 
+  set_names(worm_indices)
+```
+
+Let's also remove any neurons that are consistently NaN:
+
+```{r}
+gcamps2 <- gcamps %>%
+  map(~ {
+    ii_keep <- which(colSums(is.na(.x)) < nrow(.x))
+    .x[, ii_keep]
+  })
+```
+
+## Linear Spline Model
+We now exclude data that is interpolated over more than k_threshold steps, e.g. there are k_threshold or more consecutive NaNs in the window we are observing.
+```{r}
+stim_events <- stim_events %>% 
+  mutate(pvals_lm_10sb_30sa = map2(worm, vol, ~ {
+    worm_ind <- .x
+    vol <- .y
+    vols <- seq(vol - 20, vol + 60)
+    
+    if (all(is.na(gcamps[[worm_ind]]))) {
+        cat(str_glue("Worm {worm_ind} is NA."), fill = TRUE)
+        return(NA)
+    }
+    if (max(vols) > nrow(gcamps[[worm_ind]])) {
+      cat(str_glue("Skip: Stim in last 30 seconds of recording."),
+          fill = TRUE)
+      return(NA)
+    }
+    
+    gc <- gcamps[[worm_ind]][vols, ]
+    
+    # Create time vector: -20 to 60 (centered at stimulus)
+    time <- seq(-20, 60)
+    
+    list(apply(gc, 2, function(x) {
+      
+      # Exclude if it has ≥ k consecutive NAs
+      k_threshold = 2
+      rle_na <- rle(is.na(x))
+      if (any(rle_na$values & rle_na$lengths >= k_threshold)) {
+        return(NA)
+      }
+      
+      # Fit null model: y ~ time
+      model_null <- lm(x ~ time)
+      
+      # Fit alternative model: y ~ time + pmax(time, 0) + I(time > 0)
+      model_alt <- lm(x ~ time + pmax(time, 0) + I(time > 0))
+      
+      # F-test comparing nested models
+      f_test <- anova(model_null, model_alt)
+      
+      # Return p-value
+      f_test$`Pr(>F)`[2]
+    }))
+  }))
+```
+
+Adjust for multiple hypothesis testing with Benjamini-Hochberg:
+
+```{r}
+stim_events <- stim_events %>%
+  mutate(pvals_lm_10sb_30sa_adj = map(pvals_lm_10sb_30sa, ~ {
+    if (is.na(.x)) return(NA)
+    
+    pvals <- .x[[1]]
+    pvals_corrected <- p.adjust(pvals, method = "BH")
+    list(pvals_corrected)
+  }))
+```
+
+```{r}
+stim_events1 <- stim_events %>% filter(!is.na(pvals_lm_10sb_30sa_adj))
+pvals_lm_10sb_30sa_adj <- stim_events1 %>% 
+  pull(pvals_lm_10sb_30sa_adj) %>% 
+  map(~ enframe(.x[[1]])) %>% 
+  bind_rows(.id = "stim") %>% 
+  pivot_wider(id_cols = stim, names_from = name, values_from = value)
+```
+
+```{r}
+pval_mat <- pvals_lm_10sb_30sa_adj %>% 
+  select(-stim) %>%
+  as.matrix()
+```
+
+Look at distribution of p-values.
+
+```{r}
+ggplot(data.frame(pval = na.omit(as.vector(pval_mat))), aes(x = pval)) +
+  geom_histogram(bins = 50, fill = "lightblue", color = "white") +
+  # scale_y_log10() +
+  geom_vline(xintercept = 0.05, linetype = "dashed", color = "red") +
+  labs(title = "Distribution of P-values",
+       x = "P-value",
+       y = "Count") +
+  theme_minimal()
+```
+The p-val distribution looks bimodal which is weird.
+
+Let's filter and plot gcamp data for different p-vals:
+
+```{r}
+imin <- which(pval_mat <= sort(pval_mat)[5], arr.ind = TRUE)
+imax <- which(pval_mat >= sort(pval_mat, decreasing = TRUE)[5], arr.ind = TRUE)
+```
+
+Lowest p-vals:
+
+```{r warning=FALSE}
+for (i in 1:nrow(imin)) {
+  g <- plot_stim_response(stim_events1$worm[imin[i, 1]],
+                          stim_events1$vol[imin[i, 1]],
+                          colnames(pval_mat)[imin[i, 2]])
+  print(g)
+}
+```
+
+Highest p-vals:
+
+```{r warning=FALSE}
+for (i in 1:nrow(imax)) {
+  g <- plot_stim_response(stim_events1$worm[imax[i, 1]],
+                          stim_events1$vol[imax[i, 1]],
+                          colnames(pval_mat)[imax[i, 2]],
+                          sec_before = 20)
+  print(g)
+}
+```
+
+```{r}
+load("gt-table.Rdata")
+```
+
+```{r}
+
+# Unnest predictions
+predictions <- stim_events %>%
+  filter(!is.na(pvals_lm_10sb_30sa_adj)) %>%
+  mutate(
+    neuron_results = map(pvals_lm_10sb_30sa_adj, ~ {
+      pvals <- .x[[1]]
+      data.frame(
+        recorded_neuron = names(pvals),
+        pval_adj = as.numeric(pvals)
+      )
+    })
+  ) %>%
+  select(worm, vol, neuron_results) %>%
+  unnest(neuron_results) %>%
+  filter(!is.na(pval_adj))
+
+# Join with ground truth
+eval_data <- predictions %>%
+  inner_join(gt_table, by = c("worm", "vol", "recorded_neuron")) %>%
+  mutate(
+    # Ground truth: TRUE if should reject null (label != 0)
+    gt_positive = label != 0
+  )
+
+# Evaluate at multiple thresholds
+thresholds <- c(.00001, .0001, .001, .01, .05, .1, .15, .2, .25)
+
+results <- map_dfr(thresholds, function(thresh) {
+  eval_data %>%
+    mutate(
+      predicted_positive = pval_adj < thresh,
+      TP = predicted_positive & gt_positive,
+      FP = predicted_positive & !gt_positive,
+      TN = !predicted_positive & !gt_positive,
+      FN = !predicted_positive & gt_positive
+    ) %>%
+    summarise(
+      threshold = thresh,
+      TP = sum(TP),
+      FP = sum(FP),
+      TN = sum(TN),
+      FN = sum(FN),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      sensitivity = TP / (TP + FN),  # True Positive Rate / Recall
+      specificity = TN / (TN + FP),  # True Negative Rate
+      precision = TP / (TP + FP),    # Positive Predictive Value
+      accuracy = (TP + TN) / (TP + FP + TN + FN),
+      f1_score = 2 * (precision * sensitivity) / (precision + sensitivity)
+    )
+})
+
+# Visualize performance across thresholds
+results %>%
+  select(threshold, sensitivity, specificity, precision, accuracy, f1_score) %>%
+  pivot_longer(-threshold, names_to = "metric", values_to = "value") %>%
+  ggplot(aes(x = threshold, y = value, color = metric)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  scale_x_log10(breaks = thresholds) +
+  labs(title = "Performance Metrics vs FDR Threshold",
+       x = "FDR Threshold",
+       y = "Value",
+       color = "Metric") +
+  theme_minimal() +
+  ylim(0, 1) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```
 

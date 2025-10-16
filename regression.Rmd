@@ -690,7 +690,7 @@ stim_events <- stim_events %>%
   }))
 ```
 
-Adjust for multiple hypothesis testing with Benjamini-Hochberg:
+Adjust for multiple hypothesis testing with Benjamini-Hochberg (incorrect):
 
 ```{r}
 stim_events <- stim_events %>%
@@ -714,6 +714,34 @@ pvals_lm_10sb_30sa_adj <- stim_events1 %>%
 
 ```{r}
 pval_mat <- pvals_lm_10sb_30sa_adj %>% 
+  select(-stim) %>%
+  as.matrix()
+```
+
+Adjust for multiple hypothesis testing with Benjamini-Hochberg:
+
+```{r}
+# Unnest p-values and keep track of stim and position
+pvals_long <- stim_events %>%
+  mutate(stim = row_number()) %>%
+  filter(!is.na(pvals_lm_10sb_30sa)) %>%
+  select(stim, pvals_lm_10sb_30sa) %>%
+  mutate(pval_list = map(pvals_lm_10sb_30sa, ~ .x[[1]])) %>%
+  unnest(pval_list) %>%
+  group_by(stim) %>%
+  mutate(position = row_number()) %>%
+  ungroup()
+
+pvals_long <- pvals_long %>%
+  mutate(pval_adj = p.adjust(pval_list, method = "BH"))
+```
+
+```{r}
+# Now pivot to wide form like your original pvals_lm_10sb_30sa_adj
+pvals_wide <- pvals_long %>%
+  select(stim, position, pval_adj) %>%
+  pivot_wider(names_from = position, values_from = pval_adj)
+pval_mat <- pvals_wide %>%
   select(-stim) %>%
   as.matrix()
 ```

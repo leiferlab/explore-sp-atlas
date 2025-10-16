@@ -7,3 +7,5 @@
 
 /regression_files
 *.html
+
+.DS_Store

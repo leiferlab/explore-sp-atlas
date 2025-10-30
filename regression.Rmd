@@ -632,25 +632,91 @@ gcamps <- worm_indices %>%
   set_names(worm_indices)
 ```
 
-Let's also remove any neurons that are consistently NaN:
+```{r}
+library(zoo)
+
+# Efficient rolling quantile approach
+remove_outliers_local_quantile <- function(gcamp_matrix, window_size = 50, lower_q = 0.01, upper_q = 0.99) {
+  # For each column (neuron)
+  for (j in seq_len(ncol(gcamp_matrix))) {
+    vals <- gcamp_matrix[, j]
+    
+    # Calculate rolling lower and upper bounds
+    roll_lower <- rollapply(vals, width = 2 * window_size + 1, 
+                            FUN = function(x) quantile(x, lower_q, na.rm = TRUE),
+                            fill = NA, align = "center", partial = TRUE)
+    roll_upper <- rollapply(vals, width = 2 * window_size + 1,
+                            FUN = function(x) quantile(x, upper_q, na.rm = TRUE),
+                            fill = NA, align = "center", partial = TRUE)
+    
+    # Vectorized comparison
+    gcamp_matrix[vals < roll_lower | vals > roll_upper, j] <- NA
+  }
+  return(gcamp_matrix)
+}
+```
 
 ```{r}
-gcamps2 <- gcamps %>%
-  map(~ {
-    ii_keep <- which(colSums(is.na(.x)) < nrow(.x))
-    .x[, ii_keep]
-  })
+# Needs refining
+# gcamps <- gcamps %>%
+#   map(~ remove_outliers_local_quantile(.x, window_size = 5))
 ```
+
+
 
 ## Linear Spline Model
 We now exclude data that is interpolated over more than k_threshold steps, e.g. there are k_threshold or more consecutive NaNs in the window we are observing.
 ```{r}
-stim_events <- stim_events %>% 
-  mutate(pvals_lm_10sb_30sa = map2(worm, vol, ~ {
+# stim_events <- stim_events %>%
+#   mutate(pvals_lm_10sb_30sa = map2(worm, vol, ~ {
+#     worm_ind <- .x
+#     vol <- .y
+#     vols <- seq(vol - 20, vol + 60)
+# 
+#     if (all(is.na(gcamps[[worm_ind]]))) {
+#         cat(str_glue("Worm {worm_ind} is NA."), fill = TRUE)
+#         return(NA)
+#     }
+#     if (max(vols) > nrow(gcamps[[worm_ind]])) {
+#       cat(str_glue("Skip: Stim in last 30 seconds of recording."),
+#           fill = TRUE)
+#       return(NA)
+#     }
+# 
+#     gc <- gcamps[[worm_ind]][vols, ]
+# 
+#     # Create time vector: -20 to 60 (centered at stimulus)
+#     time <- seq(-20, 60)
+# 
+#     list(apply(gc, 2, function(x) {
+# 
+#       # Exclude if it has ≥ k consecutive NAs
+#       k_threshold = 2
+#       rle_na <- rle(is.na(x))
+#       if (any(rle_na$values & rle_na$lengths >= k_threshold)) {
+#         return(NA)
+#       }
+# 
+#       # Fit null model: y ~ time
+#       model_null <- lm(x ~ time)
+# 
+#       # Fit alternative model: y ~ time + pmax(time, 0) + I(time > 0)
+#       model_alt <- lm(x ~ time + pmax(time, 0) + I(time > 0))
+# 
+#       # F-test comparing nested models
+#       f_test <- anova(model_null, model_alt)
+# 
+#       # Return p-value
+#       f_test$`Pr(>F)`[2]
+#     }))
+#   }))
+
+stim_events1 <- stim_events1 %>%
+  mutate(pvals_lm_10sb_10sa = map2(worm, vol, ~ {
     worm_ind <- .x
     vol <- .y
-    vols <- seq(vol - 20, vol + 60)
-    
+    vols <- seq(vol - 20, vol + 20)
+
     if (all(is.na(gcamps[[worm_ind]]))) {
         cat(str_glue("Worm {worm_ind} is NA."), fill = TRUE)
         return(NA)
@@ -660,80 +726,62 @@ stim_events <- stim_events %>%
           fill = TRUE)
       return(NA)
     }
-    
+
     gc <- gcamps[[worm_ind]][vols, ]
-    
-    # Create time vector: -20 to 60 (centered at stimulus)
-    time <- seq(-20, 60)
-    
+
+    # Create time vector: -20 to 20 (centered at stimulus)
+    time <- seq(-20, 20)
+
     list(apply(gc, 2, function(x) {
-      
+
       # Exclude if it has ≥ k consecutive NAs
       k_threshold = 2
       rle_na <- rle(is.na(x))
       if (any(rle_na$values & rle_na$lengths >= k_threshold)) {
         return(NA)
       }
-      
+
       # Fit null model: y ~ time
       model_null <- lm(x ~ time)
-      
+
       # Fit alternative model: y ~ time + pmax(time, 0) + I(time > 0)
       model_alt <- lm(x ~ time + pmax(time, 0) + I(time > 0))
-      
+
       # F-test comparing nested models
       f_test <- anova(model_null, model_alt)
-      
+
       # Return p-value
       f_test$`Pr(>F)`[2]
     }))
   }))
 ```
-
-Adjust for multiple hypothesis testing with Benjamini-Hochberg (incorrect):
-
-```{r}
-stim_events <- stim_events %>%
-  mutate(pvals_lm_10sb_30sa_adj = map(pvals_lm_10sb_30sa, ~ {
-    if (is.na(.x)) return(NA)
-    
-    pvals <- .x[[1]]
-    pvals_corrected <- p.adjust(pvals, method = "BH")
-    list(pvals_corrected)
-  }))
-```
-
-```{r}
-stim_events1 <- stim_events %>% filter(!is.na(pvals_lm_10sb_30sa_adj))
-pvals_lm_10sb_30sa_adj <- stim_events1 %>% 
-  pull(pvals_lm_10sb_30sa_adj) %>% 
-  map(~ enframe(.x[[1]])) %>% 
-  bind_rows(.id = "stim") %>% 
-  pivot_wider(id_cols = stim, names_from = name, values_from = value)
-```
-
-```{r}
-pval_mat <- pvals_lm_10sb_30sa_adj %>% 
-  select(-stim) %>%
-  as.matrix()
-```
-
 Adjust for multiple hypothesis testing with Benjamini-Hochberg:
 
 ```{r}
 # Unnest p-values and keep track of stim and position
-pvals_long <- stim_events %>%
+# pvals_long <- stim_events %>%
+#   mutate(stim = row_number()) %>%
+#   filter(!is.na(pvals_lm_10sb_30sa)) %>%
+#   select(stim, pvals_lm_10sb_30sa) %>%
+#   mutate(pval_list = map(pvals_lm_10sb_30sa, ~ .x[[1]])) %>%
+#   unnest(pval_list) %>%
+#   group_by(stim) %>%
+#   mutate(position = row_number()) %>%
+#   ungroup()
+
+library(tidyverse)
+pvals_long <- stim_events1 %>%
   mutate(stim = row_number()) %>%
-  filter(!is.na(pvals_lm_10sb_30sa)) %>%
-  select(stim, pvals_lm_10sb_30sa) %>%
-  mutate(pval_list = map(pvals_lm_10sb_30sa, ~ .x[[1]])) %>%
+  filter(!is.na(pvals_lm_10sb_10sa)) %>%
+  select(stim, pvals_lm_10sb_10sa) %>%
+  mutate(pval_list = map(pvals_lm_10sb_10sa, ~ .x[[1]])) %>%
   unnest(pval_list) %>%
   group_by(stim) %>%
   mutate(position = row_number()) %>%
   ungroup()
 
 pvals_long <- pvals_long %>%
-  mutate(pval_adj = p.adjust(pval_list, method = "BH"))
+  mutate(pval_adj = p.adjust(pval_list, method = "BY"))
 ```
 
 ```{r}
@@ -758,35 +806,82 @@ ggplot(data.frame(pval = na.omit(as.vector(pval_mat))), aes(x = pval)) +
        y = "Count") +
   theme_minimal()
 ```
-The p-val distribution looks bimodal which is weird.
 
 Let's filter and plot gcamp data for different p-vals:
 
 ```{r}
-imin <- which(pval_mat <= sort(pval_mat)[5], arr.ind = TRUE)
-imax <- which(pval_mat >= sort(pval_mat, decreasing = TRUE)[5], arr.ind = TRUE)
+set.seed(123)  # for reproducibility
+
+p_thresh <- 0.0001
+
+# Indices of p-values below the threshold
+imin <- which(pval_mat <= p_thresh, arr.ind = TRUE)
+
+# Indices of p-values above the threshold
+imax <- which(pval_mat > p_thresh, arr.ind = TRUE)
+
+# Randomly sample from each group
+# For example, sample 5 indices from each side (or fewer if not enough available)
+n_samples <- 120
+
+imin_sample <- imin[sample(seq_len(nrow(imin)), 
+                           size = min(n_samples, nrow(imin)), 
+                           replace = FALSE), , drop = FALSE]
+
+imax_sample <- imax[sample(seq_len(nrow(imax)), 
+                           size = min(n_samples, nrow(imax)), 
+                           replace = FALSE), , drop = FALSE]
 ```
 
 Lowest p-vals:
 
 ```{r warning=FALSE}
-for (i in 1:nrow(imin)) {
-  g <- plot_stim_response(stim_events1$worm[imin[i, 1]],
-                          stim_events1$vol[imin[i, 1]],
-                          colnames(pval_mat)[imin[i, 2]])
-  print(g)
+for (i in 1:nrow(imin_sample)) {
+  g <- try(
+    plot_stim_response(
+      stim_events1$worm[imin_sample[i, 1]],
+      stim_events1$vol[imin_sample[i, 1]],
+      as.numeric(colnames(pval_mat)[imin_sample[i, 2]]),
+      sec_before = 20,
+      sec_before_fit = 10,
+      sec_after_fit = 30,
+      use_lm = TRUE
+    ),
+    silent = TRUE
+  )
+  
+  # Only print if it succeeded
+  if (!inherits(g, "try-error")) {
+    print(g)
+  } else {
+    message("Error at i = ", i, " — skipping.")
+  }
 }
 ```
 
 Highest p-vals:
 
 ```{r warning=FALSE}
-for (i in 1:nrow(imax)) {
-  g <- plot_stim_response(stim_events1$worm[imax[i, 1]],
-                          stim_events1$vol[imax[i, 1]],
-                          colnames(pval_mat)[imax[i, 2]],
-                          sec_before = 20)
-  print(g)
+for (i in 1:nrow(imax_sample)) {
+  g <- try(
+    plot_stim_response(
+      stim_events1$worm[imax_sample[i, 1]],
+      stim_events1$vol[imax_sample[i, 1]],
+      as.numeric(colnames(pval_mat)[imax_sample[i, 2]]),
+      sec_before = 20,
+      use_lm = TRUE,
+      sec_before_fit = 10,
+      sec_after_fit = 30
+    ),
+    silent = TRUE
+  )
+  
+  # Only print if it succeeded
+  if (!inherits(g, "try-error")) {
+    print(g)
+  } else {
+    message("Error at i = ", i, " — skipping.")
+  }
 }
 ```
 
@@ -795,12 +890,20 @@ load("gt-table.Rdata")
 ```
 
 ```{r}
+# Make sure stim IDs align between pvals_wide and stim_events1
+stim_events1$pvals_lm_10sb_10sa_adj <- pval_mat %>%
+  split(seq(nrow(.))) %>%     # split matrix rows into list of numeric vectors
+  map(~ list(.x))   
+```
+
+
+```{r}
 
 # Unnest predictions
-predictions <- stim_events %>%
-  filter(!is.na(pvals_lm_10sb_30sa_adj)) %>%
+predictions <- stim_events1 %>%
+  filter(!is.na(pvals_lm_10sb_10sa_adj)) %>%
   mutate(
-    neuron_results = map(pvals_lm_10sb_30sa_adj, ~ {
+    neuron_results = map(pvals_lm_10sb_10sa_adj, ~ {
       pvals <- .x[[1]]
       data.frame(
         recorded_neuron = names(pvals),
@@ -866,7 +969,27 @@ results %>%
   theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
 ```
 
+ROC
+```{r}
+library(pROC)
+
+roc_obj <- roc(eval_data$gt_positive, 1 - eval_data$pval_adj)  # invert pvals so higher = more likely positive
+
+# Plot ROC
+plot(roc_obj, col = "#2c7bb6", lwd = 2, main = "ROC, 10s, 30s")
+# abline(a = 0, b = 1, lty = 2, col = "gray")
+
+# Add AUC
+auc_value <- auc(roc_obj)
+legend("bottomright", legend = paste("AUC =", round(auc_value, 3)), bty = "n")
+```
+
+
+
 ## Eval
+
+
+
 
 ```{r}
 imin <- which(pval_mat <= sort(pval_mat)[100], arr.ind = TRUE)
@@ -879,7 +1002,7 @@ Lowest p-vals:
 for (i in 1:nrow(imin)) {
   g <- plot_stim_response(stim_events1$worm[imin[i, 1]],
                           stim_events1$vol[imin[i, 1]],
-                          colnames(pval_mat)[imin[i, 2]], sec_before = 20)
+                          as.numeric(colnames(pval_mat)[imin[i, 2]]), sec_before = 20)
   print(g)
 }
 ```
@@ -895,7 +1018,7 @@ Highest p-vals:
 for (i in 1:nrow(imax)) {
   g <- plot_stim_response(stim_events1$worm[imax[i, 1]],
                           stim_events1$vol[imax[i, 1]],
-                          colnames(pval_mat)[imax[i, 2]],
+                          as.numeric(colnames(pval_mat)[imin[i, 2]]),
                           sec_before = 20)
   print(g)
 }
@@ -918,10 +1041,108 @@ for (i in seq_len(nrow(imin))) {
   g <- plot_stim_response(
     stim_events1$worm[imin[i, 1]],
     stim_events1$vol[imin[i, 1]],
-    colnames(pval_mat)[imin[i, 2]],
+    as.numeric(colnames(pval_mat)[imin[i, 2]]),
     sec_before = 10
   )
   print(g)
 }
+```
+# Update plotting
+
+```{r}
+#' Plots the gcamp response to a stimulation
+#' 
+#' Plots the time series of a neuron's gcamp before and after a stimulation.
+#' 
+#' @param worm_ind The worm index (character)
+#' @param vol The volume number of the stimulation
+#' @param neuron The neuron label whose response we want to plot
+#' @param sec_before The number of seconds before the stimulation to plot
+#' @param sec_after The number of seconds after the stimulation to plot
+#' @param use_lm Logical. If TRUE, fits an interrupted time series model. If FALSE, plots means.
+#' @param sec_before_fit The number of seconds before the stimulation to use for fitting (defaults to sec_before)
+#' @param sec_after_fit The number of seconds after the stimulation to use for fitting (defaults to sec_after)
+#' 
+#' @return A ggplot object
+plot_stim_response <- function(worm_ind, vol, neuron, sec_before = 30, sec_after = 30, 
+                                use_lm = FALSE, sec_before_fit = NULL, sec_after_fit = NULL) {
+  # Set default fitting windows to match plotting windows
+  if (is.null(sec_before_fit)) sec_before_fit <- sec_before
+  if (is.null(sec_after_fit)) sec_after_fit <- sec_after
+  
+  before <- seq(2 * sec_before)
+  after <- 2 * sec_before + seq(2, 2 * sec_after + 1)
+  vols <- seq(vol - 2 * sec_before, vol + 2 * sec_after)
+  gc <- gcamps[[worm_ind]][vols, neuron]
+  times <- seq(-sec_before, sec_after, length = length(vols))
+  
+  df <- tibble(times = times, gc = gc)
+  
+  # Fit model if requested
+  if (use_lm) {
+    # Subset data for fitting based on sec_before_fit and sec_after_fit
+    df_fit <- df %>% filter(times >= -sec_before_fit & times <= sec_after_fit)
+    fit <- lm(gc ~ times + pmax(times, 0) + I(times > 0), data = df_fit)
+    # Predict for the full plotting window
+    df$fitted <- predict(fit, newdata = df)
+  }
+  
+  p <- ggplot(df, aes(x = times, y = gc)) + 
+    geom_line() +
+    geom_point() +
+    geom_vline(xintercept = 0) +
+    labs(x = "Time since stimulation (s)",
+         y = "raw gcamp",
+         title = str_glue("Worm {worm_ind}, neuron {neuron} response to vol {vol}"))
+  
+  if (use_lm) {
+    # Add fitted line
+    p <- p + 
+      geom_line(aes(y = fitted), color = "blue", linewidth = 1)
+  } else {
+    # Add mean segments (original behavior)
+    p <- p +
+      geom_segment(aes(x = -sec_before,
+                       xend = -0.5,
+                       y = mean(gc[before]),
+                       yend = mean(gc[before]))) +
+      geom_segment(aes(x = 0.5,
+                       xend = sec_after,
+                       y = mean(gc[after]),
+                       yend = mean(gc[after])))
+  }
+  
+  p
+}
+```
+
+```{r warning=FALSE}
+for (i in 1:nrow(imin)) {
+  g <- plot_stim_response(stim_events1$worm[imin[i, 1]],
+                          stim_events1$vol[imin[i, 1]],
+                          as.numeric(colnames(pval_mat)[imin[i, 2]]),
+                          sec_before = 20,
+                          use_lm = TRUE,
+                          sec_before_fit = 10,
+                          sec_after_fit = 10)
+  print(g)
+}
+```
+
+```{r}
+plot_stim_response(
+      "102", 1659, 37,
+      sec_before = 20,
+      sec_before_fit = 10,
+      sec_after_fit = 10,
+      use_lm = TRUE
+    )
+```
+```{r}
+stim_events1$worm[27]
+```
+
+```{r}
+dim(pvals_long)
 ```
 

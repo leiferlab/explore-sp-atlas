@@ -1,0 +1,818 @@
+---
+title: "Combined Response Detection Methods"
+author: "Bryan Chang"
+date: "2025-10-20"
+output: html_document
+---
+```{r setup, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(nnet)
+library(caret)
+library(pROC)
+```
+
+# Load Data
+```{r load data}
+worm_indices <- fs::dir_ls(path = "../raw_extracted_data") %>%
+  str_subset("stim_neurons.txt") %>% 
+  str_extract("(\\d+)_stim", group = 1) %>% 
+  as.numeric() %>% 
+  sort()
+
+stopifnot(all(worm_indices == seq(0, length(worm_indices) - 1)))
+
+stims <- worm_indices %>% 
+  map(~ {
+    stim_neuron_file <- str_glue("../raw_extracted_data/{.x}_stim_neurons.txt")
+    labels_file <- str_glue("../raw_extracted_data/{.x}_labels.txt")
+    vols_file <- str_glue("../raw_extracted_data/{.x}_stim_volume_i.txt")
+    labels <- readLines(labels_file)
+    dat <- tibble(
+      vol = as.numeric(readLines(vols_file)) + 1,
+      neuron_indices = as.numeric(readLines(stim_neuron_file))
+    ) %>% 
+      mutate(
+        neuron_indices = if_else(neuron_indices < 0,
+                                 neuron_indices,
+                                 neuron_indices + 1)
+      )
+    dat$neuron <- rep(NA, nrow(dat))
+    ii <- dat$neuron_indices
+    dat$neuron[ii > 0] <- labels[ii[ii > 0]]
+    return(dat)
+  })
+
+names(stims) <- worm_indices
+stim_events <- stims %>% bind_rows(.id = "worm")
+```
+
+```{r load gcamps, message=FALSE}
+gcamps <- worm_indices %>% map(~ {
+  gcamp <- read_delim(str_glue("../raw_extracted_data/{.x}_gcamp.txt"),
+                      delim = " ", col_names = FALSE)
+  times <- readr::read_csv(str_glue("../raw_extracted_data/{.x}_t.txt"),
+                           col_names = FALSE)[[1]]
+  labels <- readLines(str_glue("../raw_extracted_data/{.x}_labels.txt"))
+  ii_nolabels <- which(labels %in% c("", " "))
+  labels[ii_nolabels] <- str_glue("w{.x}_{ii_nolabels}")
+  
+  if (ncol(gcamp) != length(labels)) {
+    cat(str_glue("Worm {.x} has {length(labels)} labels but {ncol(gcamp)} gcamp columns."), fill = TRUE)
+    return(NA)
+  }
+  
+  gcamp <- as.matrix(gcamp)
+  rownames(gcamp) <- times
+  colnames(gcamp) <- labels
+  gcamp
+})
+
+names(gcamps) <- worm_indices
+
+# Average repeated neurons and remove merge/target
+gcamps <- worm_indices %>%
+  as.character() %>%
+  map(~ {
+    ii_keep <- which(!str_detect(colnames(gcamps[[.x]]), "^merge|^target"))
+    gcamps[[.x]] <- gcamps[[.x]][, ii_keep]
+    repeated <- gcamps[[.x]] %>%
+      colnames() %>% 
+      table() %>% 
+      as_tibble() %>%
+      set_names(c("neuron", "n")) %>%
+      filter(n > 1) %>% 
+      pull(neuron)
+    
+    for (neur in repeated) {
+      ii <- which(colnames(gcamps[[.x]]) == neur)
+      gcamps[[.x]][, ii[1]] <- rowMeans(gcamps[[.x]][, ii], na.rm = TRUE)
+      gcamps[[.x]] <- gcamps[[.x]][, -ii[-1]]
+    }
+    return(gcamps[[.x]])
+  }) %>% 
+  set_names(worm_indices)
+```
+
+# Method 1: Wilcoxon Rank-Sum Test
+```{r wilcoxon_test}
+TIME_BEFORE <- 20
+TIME_AFTER <- 60
+MAX_CONSECUTIVE_NAS <- 2
+
+stim_events <- stim_events %>%
+  mutate(wilcox_pvals = map2(worm, vol, ~ {
+    worm_ind <- .x
+    vol <- .y
+    vols_before <- seq(vol - TIME_BEFORE, vol - 1)
+    vols_after <- seq(vol + 1, vol + TIME_AFTER)
+    
+    if (all(is.na(gcamps[[worm_ind]]))) {
+      cat(str_glue("Worm {worm_ind} is NA."), fill = TRUE)
+      return(NA)
+    }
+    
+    if (min(vols_before) < 1 || max(vols_after) > nrow(gcamps[[worm_ind]])) {
+      cat(str_glue("Skip: Stim too close to recording boundary."), fill = TRUE)
+      return(NA)
+    }
+    
+    # Use drop = FALSE to maintain matrix structure
+    gc_before <- gcamps[[worm_ind]][vols_before, , drop = FALSE]
+    gc_after <- gcamps[[worm_ind]][vols_after, , drop = FALSE]
+    
+    # Apply over each neuron (column)
+    pvals <- sapply(seq_len(ncol(gc_before)), function(i) {
+      x_before <- gc_before[, i]
+      x_after <- gc_after[, i]
+      
+      # Check for excessive NAs
+      rle_na_before <- rle(is.na(x_before))
+      rle_na_after <- rle(is.na(x_after))
+      if (any(rle_na_before$values & rle_na_before$lengths >= MAX_CONSECUTIVE_NAS) ||
+          any(rle_na_after$values & rle_na_after$lengths >= MAX_CONSECUTIVE_NAS)) {
+        return(NA)
+      }
+      
+      # Remove NAs
+      x_before <- x_before[!is.na(x_before)]
+      x_after <- x_after[!is.na(x_after)]
+      
+      if (length(x_before) < 5 || length(x_after) < 5) {
+        return(NA)
+      }
+      
+      # Wilcoxon test
+      tryCatch({
+        test <- wilcox.test(x_after, x_before, alternative = "two.sided")
+        test$p.value
+      }, error = function(e) NA)
+    })
+    
+    list(pvals)
+  }))
+```
+
+# Method 2: Linear Model Test (20-20 and 20-60)
+```{r lm_test_20_20}
+stim_events <- stim_events %>%
+  mutate(lm_pvals_20_20 = map2(worm, vol, ~ {
+    worm_ind <- .x
+    vol <- .y
+    vols <- seq(vol - 20, vol + 20)
+    
+    if (all(is.na(gcamps[[worm_ind]]))) {
+      return(NA)
+    }
+    
+    if (min(vols) < 1 || max(vols) > nrow(gcamps[[worm_ind]])) {
+      return(NA)
+    }
+    
+    gc <- gcamps[[worm_ind]][vols, , drop = FALSE]
+    time <- seq(-20, 20)
+    
+    pvals <- sapply(seq_len(ncol(gc)), function(i) {
+      x <- gc[, i]
+      
+      rle_na <- rle(is.na(x))
+      if (any(rle_na$values & rle_na$lengths >= MAX_CONSECUTIVE_NAS)) {
+        return(NA)
+      }
+      
+      tryCatch({
+        model_null <- lm(x ~ time)
+        model_alt <- lm(x ~ time + pmax(time, 0) + I(time > 0))
+        
+        f_test <- anova(model_null, model_alt)
+        f_test[["Pr(>F)"]][2]
+      }, error = function(e) NA)
+    })
+    
+    list(pvals)
+  }))
+```
+
+```{r lm_test_20_60}
+stim_events <- stim_events %>%
+  mutate(lm_pvals_20_60 = map2(worm, vol, ~ {
+    worm_ind <- .x
+    vol <- .y
+    vols <- seq(vol - 20, vol + 60)
+    
+    if (all(is.na(gcamps[[worm_ind]]))) {
+      return(NA)
+    }
+    
+    if (min(vols) < 1 || max(vols) > nrow(gcamps[[worm_ind]])) {
+      return(NA)
+    }
+    
+    gc <- gcamps[[worm_ind]][vols, , drop = FALSE]
+    time <- seq(-20, 60)
+    
+    pvals <- sapply(seq_len(ncol(gc)), function(i) {
+      x <- gc[, i]
+      
+      rle_na <- rle(is.na(x))
+      if (any(rle_na$values & rle_na$lengths >= MAX_CONSECUTIVE_NAS)) {
+        return(NA)
+      }
+      
+      tryCatch({
+        model_null <- lm(x ~ time)
+        model_alt <- lm(x ~ time + pmax(time, 0) + I(time > 0))
+        
+        f_test <- anova(model_null, model_alt)
+        f_test[["Pr(>F)"]][2]
+      }, error = function(e) NA)
+    })
+    
+    list(pvals)
+  }))
+```
+
+# Method 3: Logistic Regression Features
+```{r calculate_features}
+stim_events <- stim_events %>%
+  rowwise() %>%
+  mutate(
+    F0 = {
+      worm_data <- gcamps[[as.character(worm)]]
+      stim_vol <- vol
+      
+      if (stim_vol <= 1) return(list(setNames(numeric(), character())))
+      vols_before <- seq_len(stim_vol - 1)
+      if (stim_vol > 60) vols_before <- (stim_vol - 60):(stim_vol - 1)
+      
+      neuron_names <- colnames(worm_data)
+      f0_vals <- sapply(neuron_names, function(nrn) {
+        mean(worm_data[vols_before, nrn], na.rm = TRUE)
+      })
+      
+      list(f0_vals)
+    },
+    
+    F = {
+      worm_data <- gcamps[[as.character(worm)]]
+      stim_vol <- vol
+      neuron_names <- colnames(worm_data)
+      total_vols <- nrow(worm_data)
+      
+      vols_after <- (stim_vol + 1):(stim_vol + 60)
+      vols_after <- vols_after[vols_after <= total_vols]
+      
+      if (length(vols_after) == 0) {
+        return(list(setNames(rep(NA_real_, length(neuron_names)), neuron_names)))
+      }
+      
+      f_vals <- sapply(neuron_names, function(nrn) {
+        mean(worm_data[vols_after, nrn], na.rm = TRUE)
+      })
+      
+      list(f_vals)
+    },
+    
+    dFF = {
+      f0_vec <- F0
+      f_vec <- F
+      dff_vals <- (f_vec - f0_vec) / f0_vec
+      list(dff_vals)
+    },
+    
+    slope_before = {
+      worm_data <- gcamps[[as.character(worm)]]
+      stim_vol <- vol
+      neuron_names <- colnames(worm_data)
+      times <- as.numeric(rownames(worm_data))
+      
+      vols_before <- (stim_vol - 20):(stim_vol - 1)
+      vols_before <- vols_before[vols_before > 0]
+      
+      if (length(vols_before) < 2) {
+        return(list(setNames(rep(NA_real_, length(neuron_names)), neuron_names)))
+      }
+      
+      slope_vals <- sapply(neuron_names, function(nrn) {
+        y <- worm_data[vols_before, nrn]
+        x <- times[vols_before]
+        valid <- !is.na(y)
+        if (sum(valid) < 2) return(NA_real_)
+        
+        fit <- lm(y[valid] ~ x[valid])
+        coef(fit)[2]
+      })
+      
+      list(slope_vals)
+    },
+    
+    slope_after = {
+      worm_data <- gcamps[[as.character(worm)]]
+      stim_vol <- vol
+      neuron_names <- colnames(worm_data)
+      times <- as.numeric(rownames(worm_data))
+      total_vols <- nrow(worm_data)
+      
+      vols_after <- (stim_vol + 1):(stim_vol + 20)
+      vols_after <- vols_after[vols_after <= total_vols]
+      
+      if (length(vols_after) < 2) {
+        return(list(setNames(rep(NA_real_, length(neuron_names)), neuron_names)))
+      }
+      
+      slope_vals <- sapply(neuron_names, function(nrn) {
+        y <- worm_data[vols_after, nrn]
+        x <- times[vols_after]
+        valid <- !is.na(y)
+        if (sum(valid) < 2) return(NA_real_)
+        
+        fit <- lm(y[valid] ~ x[valid])
+        coef(fit)[2]
+      })
+      
+      list(slope_vals)
+    }
+  ) %>%
+  ungroup()
+```
+
+```{r expand_to_long}
+stim_events_long <- stim_events %>%
+  mutate(event_id = row_number()) %>%
+  transmute(
+    event_id,
+    worm,
+    vol,
+    stim_neuron = neuron,
+    neuron_indices,
+    data = pmap(list(F0, F, dFF, slope_before, slope_after, 
+                     wilcox_pvals, lm_pvals_20_20, lm_pvals_20_60), 
+                function(f0, f, dff, sb, sa, wp, lm20, lm60) {
+      tibble(
+        recorded_neuron = names(f0),
+        F0 = unname(f0),
+        F = unname(f),
+        dFF = unname(dff),
+        slope_before = unname(sb),
+        slope_after = unname(sa),
+        wilcox_pval = if(!is.null(wp) && length(wp) > 0) unname(wp[[1]]) else NA,
+        lm_pval_20_20 = if(!is.null(lm20) && length(lm20) > 0) unname(lm20[[1]]) else NA,
+        lm_pval_20_60 = if(!is.null(lm60) && length(lm60) > 0) unname(lm60[[1]]) else NA
+      )
+    })
+  ) %>%
+  unnest(data)
+```
+
+# Train Logistic Regression
+```{r load_labels}
+load("../rdata/gt-table.Rdata")  # Contains ground truth labels
+
+training_data <- stim_events_long %>%
+  left_join(gt_table %>% select(worm, vol, recorded_neuron, label), 
+            by = c("worm", "vol", "recorded_neuron")) %>%
+  filter(!is.na(dFF), !is.na(slope_before), !is.na(slope_after),
+         is.finite(dFF), is.finite(slope_before), is.finite(slope_after))
+
+labeled_data <- training_data %>%
+  filter(!is.na(label)) %>%
+  mutate(label = factor(label, levels = c(-1, 0, 1)))
+
+# Train/test split
+set.seed(457)
+train_idx <- createDataPartition(labeled_data$label, p = 0.8, list = FALSE)
+train_set <- labeled_data[train_idx, ]
+test_set <- labeled_data[-train_idx, ]
+
+# Create marker for training set rows
+train_set_marker <- train_set %>%
+  select(worm, vol, recorded_neuron) %>%
+  mutate(in_train = TRUE)
+
+# Fit multinomial logistic regression
+multinom_model <- multinom(label ~ dFF + slope_before + slope_after,
+                          data = train_set)
+
+# Get predictions for all data
+training_data <- training_data %>%
+  filter(!is.na(dFF), !is.na(slope_before), !is.na(slope_after)) %>%
+  mutate(
+    logreg_pred = predict(multinom_model, newdata = .),
+    logreg_prob = predict(multinom_model, newdata = ., type = "probs")
+  )
+
+# Get predictions and probability matrix for all data
+logreg_pred <- predict(multinom_model, newdata = training_data)
+logreg_prob <- predict(multinom_model, newdata = training_data, type = "probs")
+
+# Ensure column names are character labels
+colnames(logreg_prob) <- as.character(colnames(logreg_prob))
+
+# Combine with training_data
+training_data <- training_data %>%
+  mutate(
+    logreg_pred = logreg_pred,
+    logreg_prob_response = logreg_prob[, "-1"] + logreg_prob[, "1"]
+  )
+
+# Mark which rows are in training set
+training_data <- training_data %>%
+  left_join(train_set_marker, by = c("worm", "vol", "recorded_neuron")) %>%
+  mutate(in_train = replace_na(in_train, FALSE))
+
+cat(str_glue("Total rows in training_data: {nrow(training_data)}\n"))
+cat(str_glue("Rows in training set: {sum(training_data$in_train)}\n"))
+cat(str_glue("Rows NOT in training set: {sum(!training_data$in_train)}\n"))
+```
+
+# Plotting Functions
+
+```{r plot_functions}
+plot_stim_response <- function(worm_ind, vol, neuron, sec_before = 30, sec_after = 30) {
+  tryCatch({
+    # Check if neuron exists
+    if (!neuron %in% colnames(gcamps[[worm_ind]])) {
+      stop(str_glue("Neuron {neuron} not found in worm {worm_ind}"))
+    }
+    
+    total_vols <- nrow(gcamps[[worm_ind]])
+    vols <- seq(vol - 2 * sec_before, vol + 2 * sec_after)
+    
+    # Ensure vols are within valid range
+    valid_mask <- vols > 0 & vols <= total_vols
+    if (sum(valid_mask) == 0) {
+      stop("No valid volumes in range")
+    }
+    
+    vols <- vols[valid_mask]
+    
+    # Extract gc values
+    gc <- gcamps[[worm_ind]][vols, neuron]
+    
+    # Verify lengths match
+    if (length(gc) != length(vols)) {
+      stop(str_glue("Length mismatch: gc={length(gc)}, vols={length(vols)}"))
+    }
+    
+    # Create time vector
+    time_vals <- seq(-sec_before, sec_after, length.out = length(vols))
+    
+    # Identify before/after indices
+    before <- which(vols < vol)
+    after <- which(vols > vol)
+    
+    # Create base plot
+    p <- ggplot(tibble(times = time_vals, gc = gc), aes(x = times, y = gc)) + 
+      geom_line() +
+      geom_point() +
+      geom_vline(xintercept = 0, color = "black", linewidth = 1) +
+      labs(x = "Time since stimulation (s)",
+           y = "Raw GCaMP",
+           title = str_glue("Worm {worm_ind}, neuron {neuron}, vol {vol}")) +
+      theme_minimal()
+    
+    # Add mean lines only if we have data
+    if (length(before) > 0) {
+      p <- p + geom_segment(aes(x = min(time_vals[before]),
+                                xend = max(time_vals[before]),
+                                y = mean(gc[before], na.rm = TRUE),
+                                yend = mean(gc[before], na.rm = TRUE)),
+                           color = "blue", linewidth = 1)
+    }
+    
+    if (length(after) > 0) {
+      p <- p + geom_segment(aes(x = min(time_vals[after]),
+                                xend = max(time_vals[after]),
+                                y = mean(gc[after], na.rm = TRUE),
+                                yend = mean(gc[after], na.rm = TRUE)),
+                           color = "red", linewidth = 1)
+    }
+    
+    return(p)
+  }, error = function(e) {
+    # Return empty plot with error message
+    ggplot() + 
+      annotate("text", x = 0.5, y = 0.5, 
+               label = str_glue("ERROR: {e$message}"),
+               size = 6, color = "red") +
+      labs(title = str_glue("Worm {worm_ind}, neuron {neuron}, vol {vol}")) +
+      theme_void()
+  })
+}
+
+plot_with_lm_fit <- function(worm_ind, vol, neuron, time_before = 20, time_after = 20) {
+  tryCatch({
+    # Check if neuron exists
+    if (!neuron %in% colnames(gcamps[[worm_ind]])) {
+      stop(str_glue("Neuron {neuron} not found in worm {worm_ind}"))
+    }
+    
+    total_vols <- nrow(gcamps[[worm_ind]])
+    vols <- seq(vol - time_before, vol + time_after)
+    
+    # Ensure vols are within valid range
+    valid_mask <- vols > 0 & vols <= total_vols
+    if (sum(valid_mask) < 10) {
+      stop("Insufficient valid volumes for fitting")
+    }
+    
+    vols <- vols[valid_mask]
+    
+    # Extract gc values
+    gc <- gcamps[[worm_ind]][vols, neuron]
+    
+    # Verify lengths match
+    if (length(gc) != length(vols)) {
+      stop(str_glue("Length mismatch: gc={length(gc)}, vols={length(vols)}"))
+    }
+    
+    # Create time vector relative to stimulation
+    time <- vols - vol
+    
+    # Remove NA values for model fitting
+    valid_idx <- !is.na(gc)
+    if (sum(valid_idx) < 5) {
+      stop("Too many NAs for model fitting")
+    }
+    
+    # Fit models on valid data only
+    gc_valid <- gc[valid_idx]
+    time_valid <- time[valid_idx]
+    
+    model_null <- lm(gc_valid ~ time_valid)
+    model_alt <- lm(gc_valid ~ time_valid + pmax(time_valid, 0) + I(time_valid > 0))
+    
+    # Create prediction data frame
+    pred_df <- data.frame(time_valid = time)
+    pred_null <- predict(model_null, newdata = pred_df)
+    pred_alt <- predict(model_alt, newdata = pred_df)
+    
+    # Verify all vectors have same length
+    if (length(time) != length(gc) || length(time) != length(pred_null) || length(time) != length(pred_alt)) {
+      stop(str_glue("Length mismatch: time={length(time)}, gc={length(gc)}, pred_null={length(pred_null)}, pred_alt={length(pred_alt)}"))
+    }
+    
+    # Create plot with lines connecting data points
+    ggplot(tibble(time = time, gc = gc, pred_null = pred_null, pred_alt = pred_alt), 
+           aes(x = time, y = gc)) +
+      geom_line(color = "gray50") +  # Line connecting actual data points
+      geom_point() +
+      geom_line(aes(y = pred_null), color = "blue", linetype = "dashed", linewidth = 1) +
+      geom_line(aes(y = pred_alt), color = "red", linewidth = 1) +
+      geom_vline(xintercept = 0, linewidth = 1) +
+      labs(x = "Time (frames)",
+           y = "Raw GCaMP",
+           title = str_glue("LM Test: Worm {worm_ind}, neuron {neuron}, vol {vol}"),
+           subtitle = "Gray = data, Blue dashed = null model, Red = change-point model") +
+      theme_minimal()
+  }, error = function(e) {
+    # Return empty plot with error message
+    ggplot() + 
+      annotate("text", x = 0.5, y = 0.5, 
+               label = str_glue("ERROR: {e$message}"),
+               size = 6, color = "red") +
+      labs(title = str_glue("LM Test: Worm {worm_ind}, neuron {neuron}, vol {vol}"),
+           subtitle = "Gray = data, Blue dashed = null model, Red = change-point model") +
+      theme_void()
+  })
+}
+
+plot_with_features <- function(worm_ind, vol, neuron, features_row) {
+  tryCatch({
+    p1 <- plot_stim_response(worm_ind, vol, neuron, sec_before = 20, sec_after = 20)
+    
+    p1 + labs(subtitle = str_glue(
+      "dFF={round(features_row$dFF, 3)}, slope_before={round(features_row$slope_before, 4)}, slope_after={round(features_row$slope_after, 4)}\nPred={features_row$logreg_pred}, P(response)={round(features_row$logreg_prob_response, 3)}"
+    ))
+  }, error = function(e) {
+    # Return empty plot with error message
+    ggplot() + 
+      annotate("text", x = 0.5, y = 0.5, 
+               label = str_glue("ERROR: {e$message}"),
+               size = 6, color = "red") +
+      labs(title = str_glue("Worm {worm_ind}, neuron {neuron}, vol {vol}"),
+           subtitle = str_glue(
+             "dFF={round(features_row$dFF, 3)}, slope_before={round(features_row$slope_before, 4)}, slope_after={round(features_row$slope_after, 4)}\nPred={features_row$logreg_pred}, P(response)={round(features_row$logreg_prob_response, 3)}"
+           )) +
+      theme_void()
+  })
+}
+```
+
+# Sample Random Positives
+```{r sample_positives}
+set.seed(123)
+
+# Define positive threshold
+P_THRESHOLD <- 0.05
+N_SAMPLES <- 250
+
+# First, filter to only observations with valid values for ALL tests
+# and exclude training set
+valid_for_all_tests <- training_data %>%
+  filter(
+    !in_train,  # Exclude training set
+    !is.na(wilcox_pval),
+    !is.na(lm_pval_20_20),
+    !is.na(lm_pval_20_60),
+    !is.na(dFF),
+    !is.na(slope_before),
+    !is.na(slope_after),
+    !is.na(logreg_pred),
+    !is.na(logreg_prob_response)
+  )
+
+cat(str_glue("Total observations valid for all tests (excluding training): {nrow(valid_for_all_tests)}\n"))
+
+# Method 1: Wilcoxon
+wilcox_positives <- valid_for_all_tests %>%
+  filter(wilcox_pval < P_THRESHOLD) %>%
+  sample_n(min(N_SAMPLES, n()))
+
+cat(str_glue("Wilcoxon positives sampled: {nrow(wilcox_positives)}\n"))
+
+# Method 2: LM 20-20
+lm_20_20_positives <- valid_for_all_tests %>%
+  filter(lm_pval_20_20 < P_THRESHOLD) %>%
+  sample_n(min(N_SAMPLES, n()))
+
+cat(str_glue("LM 20-20 positives sampled: {nrow(lm_20_20_positives)}\n"))
+
+# Method 3: LM 20-60
+lm_20_60_positives <- valid_for_all_tests %>%
+  filter(lm_pval_20_60 < P_THRESHOLD) %>%
+  sample_n(min(N_SAMPLES, n()))
+
+cat(str_glue("LM 20-60 positives sampled: {nrow(lm_20_60_positives)}\n"))
+
+# Method 4: Logistic Regression
+logreg_positives <- valid_for_all_tests %>%
+  filter(logreg_pred %in% c("-1", "1")) %>%
+  sample_n(min(N_SAMPLES, n()))
+
+cat(str_glue("LogReg positives sampled: {nrow(logreg_positives)}\n"))
+
+# Create assessment table
+assessment_table <- bind_rows(
+  wilcox_positives %>% mutate(method = "Wilcoxon", sample_id = row_number()),
+  lm_20_20_positives %>% mutate(method = "LM_20_20", sample_id = row_number()),
+  lm_20_60_positives %>% mutate(method = "LM_20_60", sample_id = row_number()),
+  logreg_positives %>% mutate(method = "LogReg", sample_id = row_number())
+) %>%
+  mutate(
+    manual_label = NA_character_,  # For you to fill in
+    notes = NA_character_
+  ) %>%
+  select(method, sample_id, worm, vol, stim_neuron, recorded_neuron,
+         wilcox_pval, lm_pval_20_20, lm_pval_20_60, 
+         logreg_pred, logreg_prob_response,
+         dFF, slope_before, slope_after,
+         label, manual_label, notes, in_train)
+
+# Verify no training samples and all have complete data
+cat(str_glue("\nTraining samples in assessment table: {sum(assessment_table$in_train)}\n"))
+cat(str_glue("Rows with any NA test values: {sum(is.na(assessment_table$wilcox_pval) | is.na(assessment_table$lm_pval_20_20) | is.na(assessment_table$lm_pval_20_60))}\n"))
+
+# Save assessment table
+write_csv(assessment_table, "assessment_table.csv")
+```
+
+# Plot Sampled Positives
+```{r plot_wilcoxon, warning=FALSE, fig.width=10, fig.height=6}
+for (i in 1:nrow(wilcox_positives)) {
+  row <- wilcox_positives[i, ]
+  
+  tryCatch({
+    p <- plot_stim_response(row$worm, row$vol, row$recorded_neuron, sec_before = 20, sec_after = 20) +
+      labs(subtitle = str_glue(
+        "Method: Wilcoxon | p-value = {round(row$wilcox_pval, 4)}\nStim neuron: {row$stim_neuron} | True label: {ifelse(is.na(row$label), 'Unknown', row$label)}"
+      ))
+    print(p)
+  }, error = function(e) {
+    message("⚠️ Skipped: worm=", row$worm, " vol=", row$vol, 
+            " neuron=", row$recorded_neuron, " (error: ", e$message, ")")
+  })
+}
+```
+```{r plot_lm_20_20, warning=FALSE, fig.width=10, fig.height=6}
+for (i in 1:nrow(lm_20_20_positives)) {
+  row <- lm_20_20_positives[i, ]
+  
+  tryCatch({
+    p <- plot_with_lm_fit(row$worm, row$vol, row$recorded_neuron, 20, 20) +
+      labs(subtitle = str_glue(
+        "Method: LM 20-20 | p-value = {round(row$lm_pval_20_20, 4)}\nStim neuron: {row$stim_neuron} | True label: {ifelse(is.na(row$label), 'Unknown', row$label)}"
+      ))
+    print(p)
+  }, error = function(e) {
+    message("⚠️ Skipped (LM 20-20): worm=", row$worm, 
+            " vol=", row$vol, 
+            " neuron=", row$recorded_neuron, 
+            " | error: ", e$message)
+  })
+}
+```
+
+```{r plot_lm_20_60, warning=FALSE, fig.width=10, fig.height=6}
+for (i in 1:nrow(lm_20_60_positives)) {
+  row <- lm_20_60_positives[i, ]
+  
+  tryCatch({
+    p <- plot_with_lm_fit(row$worm, row$vol, row$recorded_neuron, 20, 60) +
+      labs(subtitle = str_glue(
+        "Method: LM 20-60 | p-value = {round(row$lm_pval_20_60, 4)}\nStim neuron: {row$stim_neuron} | True label: {ifelse(is.na(row$label), 'Unknown', row$label)}"
+      ))
+    print(p)
+  }, error = function(e) {
+    message("⚠️ Skipped (LM 20-60): worm=", row$worm, 
+            " vol=", row$vol, 
+            " neuron=", row$recorded_neuron, 
+            " | error: ", e$message)
+  })
+}
+```
+
+```{r plot_logreg, warning=FALSE, fig.width=10, fig.height=6}
+for (i in 1:nrow(logreg_positives)) {
+  row <- logreg_positives[i, ]
+  
+  tryCatch({
+    p <- plot_with_features(row$worm, row$vol, row$recorded_neuron, row) +
+      labs(subtitle = str_glue(
+        "Method: LogReg | Prediction: {row$logreg_pred} | P(response) = {round(row$logreg_prob_response, 3)}\nStim neuron: {row$stim_neuron} | True label: {ifelse(is.na(row$label), 'Unknown', row$label)}"
+      ))
+    print(p)
+  }, error = function(e) {
+    message("⚠️ Skipped (LogReg): worm=", row$worm, 
+            " vol=", row$vol, 
+            " neuron=", row$recorded_neuron, 
+            " | error: ", e$message)
+  })
+}
+```
+
+# ROC Curves
+```{r roc_analysis}
+# Get labeled data only
+training_data <- read.csv("assessment_table_filled.csv")
+
+labeled_test_data <- training_data %>%
+  filter(!is.na(manual_label)) %>%
+  mutate(
+    is_response = as.numeric(manual_label != 0),  # Binary: 0 = no response, 1 = response
+    wilcox_score = 1 - wilcox_pval,  # Convert p-value to score (lower p = higher score)
+    lm_20_20_score = 1 - lm_pval_20_20,
+    lm_20_60_score = 1 - lm_pval_20_60
+  )
+
+# Calculate ROC curves
+roc_wilcox <- roc(labeled_test_data$is_response, labeled_test_data$wilcox_score, 
+                  na.rm = TRUE)
+roc_lm_20_20 <- roc(labeled_test_data$is_response, labeled_test_data$lm_20_20_score,
+                    na.rm = TRUE)
+roc_lm_20_60 <- roc(labeled_test_data$is_response, labeled_test_data$lm_20_60_score,
+                    na.rm = TRUE)
+roc_logreg <- roc(labeled_test_data$is_response, labeled_test_data$logreg_prob_response,
+                  na.rm = TRUE)
+
+# Plot ROC curves
+plot(roc_wilcox, col = "blue", lwd = 2, main = "ROC Curves: Response Detection Methods")
+plot(roc_lm_20_20, col = "green", lwd = 2, add = TRUE)
+plot(roc_lm_20_60, col = "orange", lwd = 2, add = TRUE)
+plot(roc_logreg, col = "red", lwd = 2, add = TRUE)
+legend("bottomright", 
+       legend = c(
+         str_glue("Wilcoxon (AUC = {round(auc(roc_wilcox), 3)})"),
+         str_glue("LM 20-20 (AUC = {round(auc(roc_lm_20_20), 3)})"),
+         str_glue("LM 20-60 (AUC = {round(auc(roc_lm_20_60), 3)})"),
+         str_glue("LogReg (AUC = {round(auc(roc_logreg), 3)})")
+       ),
+       col = c("blue", "green", "orange", "red"),
+       lwd = 2)
+
+# Print AUC values
+cat("\nAUC Values:\n")
+cat(str_glue("Wilcoxon: {round(auc(roc_wilcox), 3)}\n"))
+cat(str_glue("LM 20-20: {round(auc(roc_lm_20_20), 3)}\n"))
+cat(str_glue("LM 20-60: {round(auc(roc_lm_20_60), 3)}\n"))
+cat(str_glue("LogReg: {round(auc(roc_logreg), 3)}\n"))
+```
+```{r save_ROC_plot}
+ggroc(list(
+  Wilcoxon = roc_wilcox,
+  `LM 20-20` = roc_lm_20_20,
+  `LM 20-60` = roc_lm_20_60,
+  LogReg = roc_logreg
+)) +
+  theme_minimal() +
+  labs(title = "ROC Curves: Response Detection Methods")
+
+# Save as PNG
+ggsave("../roc_curves.png", width = 10, height = 6, dpi = 300)
+```
+
+
+```{r save_results}
+save(stim_events_long, training_data, assessment_table,
+     roc_wilcox, roc_lm_20_20, roc_lm_20_60, roc_logreg,
+     file = "combined_methods_results.Rdata")
+```

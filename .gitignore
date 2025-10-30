@@ -4,6 +4,7 @@
 .Ruserdata
 
 *.Rdata
+*.csv
 
 /regression_files
 *.html

@@ -796,6 +796,12 @@ cat(str_glue("LM 20-20: {round(auc(roc_lm_20_20), 3)}\n"))
 cat(str_glue("LM 20-60: {round(auc(roc_lm_20_60), 3)}\n"))
 cat(str_glue("LogReg: {round(auc(roc_logreg), 3)}\n"))
 ```
+
+```{r}
+# LR with just dFF
+```
+
+
 ```{r save_ROC_plot}
 ggroc(list(
   Wilcoxon = roc_wilcox,

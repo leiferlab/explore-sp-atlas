@@ -1,0 +1,81 @@
+---
+title: "Second Classifier"
+author: "Bryan Chang"
+date: "2025-11-19"
+output: html_document
+---
+
+```{r setup, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(igraph)
+```
+
+```{r}
+connectome <- read.delim("../connectome/aconnectome_witvliet_2020_8.csv")
+
+chem_edges <- connectome %>% 
+  filter(type == "chemical") %>%
+  select(pre, post, synapses)
+
+g_chem <- graph_from_data_frame(
+  chem_edges,
+  directed = TRUE
+)
+
+elec_edges <- connectome %>% 
+  filter(type == "electrical") %>%
+  select(pre, post, synapses)
+
+elec <- elec_edges
+elec_rev <- data.frame(pre = elec$post, post = elec$pre, synapses = elec$synapses)
+elec_edges_bidirectional <- rbind(elec, elec_rev)
+g_elec <- graph_from_data_frame(elec_edges_bidirectional, directed = TRUE)
+
+g_all <- igraph::union(g_chem, g_elec)
+
+# Directed shortest-path distances
+dist_mat <- igraph::distances(
+  g_all,
+  mode = "out",      # from pre → post direction
+  weights = NA       # treat all edges as unweighted; set weights=edge weights if desired
+)
+
+# Convert to a data.frame-friendly form
+dist_df <- as.data.frame(dist_mat)
+dist_df$from <- rownames(dist_df)
+
+```
+
+```{r}
+par(mfrow = c(1, 2), mar = c(0,0,1,0))
+
+svg("../figures/chem_connectome.svg", width = 10, height = 10)
+
+plot(
+  g_chem,
+  vertex.label = NA,
+  vertex.size = 3,
+  edge.arrow.size = 0.2,
+  main = "Chemical Synapse Connectome",
+  layout = layout_with_fr(g_chem)
+)
+
+dev.off()
+
+svg("../figures/elec_connectome.svg", width = 10, height = 10)
+
+plot(
+  g_elec,
+  vertex.label = NA,
+  vertex.size = 3,
+  edge.arrow.size = 0.2,
+  main = "Gap Junction Connectome",
+  layout = layout_with_fr(g_elec)
+)
+
+dev.off()
+
+par(mfrow = c(1,1))
+
+```
+

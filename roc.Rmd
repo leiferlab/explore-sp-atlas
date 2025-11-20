@@ -335,6 +335,61 @@ stim_events <- stim_events %>%
   ungroup()
 ```
 
+Let's make a feature "rank" that records the number of stimulations have occurred prior to the current one for this worm:
+```{r}
+stim_events <- stim_events %>% 
+  group_by(worm) %>% 
+  mutate(rank = rank(vol) - 1) %>% 
+  ungroup()
+```
+
+```{r}
+stim_events <- stim_events %>%
+  group_by(worm, neuron) %>%
+  arrange(vol) %>%
+  mutate(stim_count_for_stim_neuron = row_number() - 1) %>%
+  ungroup()
+# Note: neuron may be NA for blank stim; handle accordingly if needed
+```
+
+# Get connectome features
+```{r}
+library(igraph)
+connectome <- read.delim("../connectome/aconnectome_witvliet_2020_8.csv")
+
+chem_edges <- connectome %>% 
+  filter(type == "chemical") %>%
+  select(pre, post, synapses)
+
+g_chem <- graph_from_data_frame(
+  chem_edges,
+  directed = TRUE
+)
+
+elec_edges <- connectome %>% 
+  filter(type == "electrical") %>%
+  select(pre, post, synapses)
+
+elec <- elec_edges
+elec_rev <- data.frame(pre = elec$post, post = elec$pre, synapses = elec$synapses)
+elec_edges_bidirectional <- rbind(elec, elec_rev)
+g_elec <- graph_from_data_frame(elec_edges_bidirectional, directed = TRUE)
+
+g_all <- igraph::union(g_chem, g_elec)
+
+# Directed shortest-path distances
+dist_mat <- igraph::distances(
+  g_all,
+  mode = "out",      # from pre → post direction
+  weights = NA       # treat all edges as unweighted; set weights=edge weights if desired
+)
+
+# Convert to a data.frame-friendly form
+dist_df <- as.data.frame(dist_mat)
+dist_df$from <- rownames(dist_df)
+
+```
+
 ```{r expand_to_long}
 stim_events_long <- stim_events %>%
   mutate(event_id = row_number()) %>%
@@ -343,6 +398,8 @@ stim_events_long <- stim_events %>%
     worm,
     vol,
     stim_neuron = neuron,
+    rank,
+    stim_count_for_stim_neuron,
     neuron_indices,
     data = pmap(list(F0, F, dFF, slope_before, slope_after, 
                      wilcox_pvals, lm_pvals_20_20, lm_pvals_20_60), 
@@ -363,7 +420,30 @@ stim_events_long <- stim_events %>%
   unnest(data)
 ```
 
-# Train Logistic Regression
+# Add connectome features
+```{r}
+safe_dist <- function(stim, rec, dist_mat) {
+  # If either neuron missing → return NA
+  if (!(stim %in% rownames(dist_mat)) || !(rec %in% colnames(dist_mat))) {
+    return(NA_real_)
+  }
+  
+  d <- dist_mat[stim, rec]
+  if (!is.finite(d)) return(NA_real_)  # unreachable
+  return(d)
+}
+
+safe_dist_vec <- Vectorize(function(a, b) safe_dist(a, b, dist_mat))
+
+stim_events_long <- stim_events_long %>%
+  mutate(
+    connectome_path_length =
+      safe_dist_vec(stim_neuron, recorded_neuron),
+    has_path = !is.na(connectome_path_length)
+  )
+```
+
+# Train Multinomial Logistic Regression
 ```{r load_labels}
 load("../rdata/gt-table.Rdata")  # Contains ground truth labels
 
@@ -423,6 +503,203 @@ cat(str_glue("Total rows in training_data: {nrow(training_data)}\n"))
 cat(str_glue("Rows in training set: {sum(training_data$in_train)}\n"))
 cat(str_glue("Rows NOT in training set: {sum(!training_data$in_train)}\n"))
 ```
+
+# Train Binomial Logistic Regression (ignores negative responses)
+```{r}
+load("../rdata/gt-table.Rdata")  # Contains ground truth labels
+
+# Merge labels + basic cleaning
+training_data <- stim_events_long %>%
+  left_join(gt_table %>% select(worm, vol, recorded_neuron, label),
+            by = c("worm", "vol", "recorded_neuron")) %>%
+  filter(
+    !is.na(dFF), !is.na(slope_before), !is.na(slope_after),
+    is.finite(dFF), is.finite(slope_before), is.finite(slope_after)
+  )
+
+# Remove all -1 labels entirely
+labeled_data <- training_data %>%
+  filter(label %in% c(0, 1)) %>%   # <<< key change
+  mutate(label = factor(label, levels = c(0, 1)))
+
+# Train/test split
+set.seed(457)
+train_idx <- createDataPartition(labeled_data$label, p = 0.8, list = FALSE)
+train_set <- labeled_data[train_idx, ]
+test_set  <- labeled_data[-train_idx, ]
+
+# Mark training rows
+train_set_marker <- train_set %>%
+  select(worm, vol, recorded_neuron) %>%
+  mutate(in_train = TRUE)
+
+# Fit logistic regression (binomial, not multinomial)
+binary_model <- glm(
+  label ~ dFF + slope_before + slope_after,
+  data = train_set,
+  family = binomial()
+)
+
+# Predict probabilities for all cleaned training_data
+training_data <- training_data %>%
+  # keep only rows where logistic regression is valid
+  filter(
+    !is.na(dFF), !is.na(slope_before), !is.na(slope_after),
+    is.finite(dFF), is.finite(slope_before), is.finite(slope_after)
+  ) %>%
+  mutate(
+    # prob of label = 1
+    logreg_prob = predict(binary_model, newdata = ., type = "response"),
+    # predicted class
+    logreg_pred = ifelse(logreg_prob > 0.5, 1, 0)
+  )
+
+# Mark training set rows
+training_data <- training_data %>%
+  left_join(train_set_marker, by = c("worm", "vol", "recorded_neuron")) %>%
+  mutate(in_train = replace_na(in_train, FALSE))
+
+cat(str_glue("Total rows in training_data: {nrow(training_data)}\n"))
+cat(str_glue("Rows in training set: {sum(training_data$in_train)}\n"))
+cat(str_glue("Rows NOT in training set: {sum(!training_data$in_train)}\n"))
+```
+
+# Attempt second model
+```{r}
+# Filter out neurons not in connectome and neurons with too much interpolation
+valid_neurons <- colnames(dist_mat)
+
+training_data <- training_data %>%
+  mutate(
+    stim_neuron = as.character(stim_neuron),
+    recorded_neuron = as.character(recorded_neuron)
+  ) %>%
+  filter(
+    # Both neurons must be in the connectome
+    stim_neuron %in% valid_neurons,
+    recorded_neuron %in% valid_neurons,
+    
+    # # Wilcoxon p-value must be non-missing
+    # !is.na(wilcox_pval)
+  )
+```
+
+```{r}
+# Filter out neurons not in connectome and neurons with too much interpolation
+valid_neurons <- colnames(dist_mat)
+
+training_data <- training_data %>%
+  mutate(
+    stim_neuron = as.character(stim_neuron),
+    recorded_neuron = as.character(recorded_neuron)
+  ) %>%
+  filter(
+    # Both neurons must be in the connectome
+    stim_neuron %in% valid_neurons,
+    recorded_neuron %in% valid_neurons,
+    
+    # Wilcoxon p-value must be non-missing
+    !is.na(wilcox_pval)
+  )
+```
+
+```{r}
+model_df <- training_data %>%
+  transmute(
+    rank,
+    stim_count_for_stim_neuron,
+    connectome_path_length,
+    has_path = as.numeric(has_path),   # convert logical → numeric if needed
+    logreg_prob = as.numeric(logreg_prob)
+  ) %>%
+  filter(!is.na(logreg_prob))
+```
+
+```{r}
+svg("../figures/prob_dist.svg", width = 10, height = 10)
+
+ggplot(model_df, aes(x = logreg_prob)) +
+  geom_histogram(bins = 50, color = "white", fill = "steelblue") +
+  labs(
+    title = "Histogram of logreg_prob",
+    x = "logreg_prob",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+dev.off()
+```
+
+
+```{r}
+# Train/test split
+set.seed(123)
+idx <- createDataPartition(model_df$logreg_prob, p = 0.8, list = FALSE)
+
+trainX <- model_df[idx, ]
+testX  <- model_df[-idx, ]
+
+# Example: logistic regression replaced with simple linear model
+prob_model <- lm(plogis(logreg_prob) ~ rank,
+                 data = trainX)
+
+summary(prob_model)
+
+pred_prob <- predict(prob_model, newdata = testX)
+```
+
+```{r}
+# Train/test split
+set.seed(123)
+idx <- createDataPartition(model_df$logreg_prob, p = 0.8, list = FALSE)
+
+trainX <- model_df[idx, ]
+testX  <- model_df[-idx, ]
+
+# Example: logistic regression replaced with simple linear model
+prob_model <- glm(logreg_prob ~ rank + stim_count_for_stim_neuron +
+                   connectome_path_length + has_path,
+                 data = trainX, family = binomial)
+
+summary(prob_model)
+
+pred_prob <- predict(prob_model, newdata = testX)
+```
+
+```{r}
+# Beta model?
+library(betareg)
+
+eps <- 1e-6
+prob_beta <- pmin(pmax(model_df$logreg_prob, eps), 1 - eps)
+
+beta_model <- betareg(
+  prob_beta ~ rank + stim_count_for_stim_neuron +
+               connectome_path_length,
+  data = model_df
+)
+
+summary(beta_model)
+```
+
+```{r}
+library(mgcv)
+gam_model <- gam(
+  prob_beta ~ 
+    s(rank, k = 5) +
+    s(stim_count_for_stim_neuron, k = 5) +
+    s(connectome_path_length, k = 5),
+  data = model_df
+)
+summary(gam_model)
+
+svg("../figures/gam_spline.svg", width = 10, height = 10)
+plot(gam_model, pages = 1)
+dev.off()
+```
+
+
+
 
 # Plotting Functions
 
@@ -820,5 +1097,5 @@ ggsave("../roc_curves.png", width = 10, height = 6, dpi = 300)
 ```{r save_results}
 save(stim_events_long, training_data, assessment_table,
      roc_wilcox, roc_lm_20_20, roc_lm_20_60, roc_logreg,
-     file = "combined_methods_results.Rdata")
+     file = "../combined_methods_results.Rdata")
 ```

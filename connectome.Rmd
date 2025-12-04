@@ -78,4 +78,22 @@ dev.off()
 par(mfrow = c(1,1))
 
 ```
+```{r reading neuropeptidergic connectome}
+# Take this file from https://github.com/LidiaRipollSanchez/Neuropeptide-Connectome.git
+neuropeptidergic_connectome <- read.csv("../connectome/01022024_neuropeptide_connectome_mid_range_model.csv",
+                                        row.names = 1,
+                                        check.names = FALSE)
+
+# Convert dataframe to matrix
+np_mat <- as.matrix(neuropeptidergic_connectome)
+
+# Build a directed graph. Weighted edges come from the matrix entries.
+g_np <- graph_from_adjacency_matrix(
+  np_mat,
+  mode = "directed",
+  weighted = TRUE,
+  diag = FALSE
+)
+```
+
 

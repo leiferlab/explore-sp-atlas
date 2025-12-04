@@ -1,5 +1,5 @@
 ---
-title: "Combined Response Detection Methods"
+title: "ROC and Second Classifier"
 author: "Bryan Chang"
 date: "2025-10-20"
 output: html_document
@@ -443,7 +443,8 @@ stim_events_long <- stim_events_long %>%
   )
 ```
 
-# Train Multinomial Logistic Regression
+# 1. Train a Response Detector to Output Whether or Not a Trace Represents a Response
+## Train a Multinomial Logistic Regression Model
 ```{r load_labels}
 load("../rdata/gt-table.Rdata")  # Contains ground truth labels
 
@@ -503,8 +504,7 @@ cat(str_glue("Total rows in training_data: {nrow(training_data)}\n"))
 cat(str_glue("Rows in training set: {sum(training_data$in_train)}\n"))
 cat(str_glue("Rows NOT in training set: {sum(!training_data$in_train)}\n"))
 ```
-
-# Train Binomial Logistic Regression (ignores negative responses)
+## Train Binomial Logistic Regression (ignores negative responses)
 ```{r}
 load("../rdata/gt-table.Rdata")  # Contains ground truth labels
 
@@ -560,11 +560,19 @@ training_data <- training_data %>%
   mutate(in_train = replace_na(in_train, FALSE))
 
 cat(str_glue("Total rows in training_data: {nrow(training_data)}\n"))
-cat(str_glue("Rows in training set: {sum(training_data$in_train)}\n"))
-cat(str_glue("Rows NOT in training set: {sum(!training_data$in_train)}\n"))
 ```
 
-# Attempt second model
+```{r Does stim_neuron==recorded_neuron increase probability of response?}
+training_data %>%
+  summarize(
+    frac_same = mean(logreg_pred[stim_neuron == recorded_neuron], na.rm = TRUE),
+    frac_diff = mean(logreg_pred[stim_neuron != recorded_neuron], na.rm = TRUE)
+  )
+```
+
+
+# 2. Train a Model to Predict Whether Response Will Occur Given Stimulation History
+## First, I try to predict logreg p.
 ```{r}
 # Filter out neurons not in connectome and neurons with too much interpolation
 valid_neurons <- colnames(dist_mat)
@@ -698,7 +706,346 @@ plot(gam_model, pages = 1)
 dev.off()
 ```
 
+## It may be more interpretable to predict a binary response with GLM.
+```{r creates df for glm model with bin classes}
+# Compute response of each stim neuron to itself
+self_response <- training_data %>%
+  filter(stim_neuron == recorded_neuron) %>%
+  group_by(stim_neuron, worm, vol) %>%
+  summarize(
+    stim_self_responded = as.integer(any(logreg_pred == 1, na.rm = TRUE)),
+    .groups = "drop"
+  )
 
+model_df_bin <- training_data %>%
+  left_join(self_response,
+            by = c("stim_neuron", "worm", "vol")) %>%
+  mutate(
+    # stim_neuron never had a self-recording row for that worm+vol
+    stim_self_responded = replace_na(stim_self_responded, 0)
+  ) %>%
+  transmute(
+    rank,
+    stim_count_for_stim_neuron,
+    connectome_path_length,
+    has_path = as.numeric(has_path),   # Convert logical to numeric if needed
+    logreg_pred = as.factor(logreg_pred),
+    stim_self_responded,
+    stim_neuron,
+    recorded_neuron,
+    worm,
+    vol
+  ) %>%
+  filter(!is.na(logreg_pred)) %>%
+  mutate(
+    # Compute inverse path length. Consider exponential decay too
+    same_node = ifelse(!is.na(connectome_path_length) &
+                         connectome_path_length == 0,
+                       1, 0),
+
+    inv_dist = ifelse(!is.na(connectome_path_length) &
+                        connectome_path_length > 0,
+                      1 / connectome_path_length,
+                      0)
+  ) %>%
+  mutate(
+    # Impute connectome_path_length to median
+    connectome_path_length = case_when(
+      is.na(connectome_path_length) ~ median(connectome_path_length, na.rm = TRUE),  # Impute median
+      TRUE ~ connectome_path_length  # Keep existing values if not NA
+    )
+  )
+
+model_df_bin %>%
+  distinct(stim_neuron, worm, vol, stim_self_responded) %>%
+  summarize(frac_stim_self_responded = mean(stim_self_responded, na.rm = TRUE))
+
+self_response %>%
+  summarize(frac_stim_self_responded = mean(stim_self_responded))
+```
+
+```{r glm rank only}
+# Strangely, glm on rank still has a positive coefficient
+# Fit logistic regression
+logreg_model <- glm(
+  logreg_pred ~ rank,
+  data = model_df_bin,
+  family = binomial(link = "logit")
+)
+
+# View model summary
+summary(logreg_model)
+
+# Predict probabilities for the positive class
+predicted_prob <- predict(logreg_model, type = "response")
+# Create the ROC curve
+roc_curve <- roc(model_df_bin$logreg_pred, predicted_prob)
+# Plot the ROC curve
+plot(roc_curve, main = "ROC Curve", col = "blue", lwd = 2)
+# Calculate and display AUC
+auc(roc_curve)
+```
+```{r glm with connectome path length}
+# Fit logistic regression
+logreg_model <- glm(
+  logreg_pred ~ rank +
+    stim_count_for_stim_neuron +
+    connectome_path_length +
+    has_path,
+  data = model_df_bin,
+  family = binomial(link = "logit")
+)
+
+# View model summary
+summary(logreg_model)
+
+# Predict probabilities for the positive class
+predicted_prob <- predict(logreg_model, type = "response")
+# Create the ROC curve
+roc_curve <- roc(model_df_bin$logreg_pred, predicted_prob)
+# Plot the ROC curve
+plot(roc_curve, main = "ROC Curve", col = "blue", lwd = 2)
+# Calculate and display AUC
+auc(roc_curve)
+```
+```{r glm with inverse path length and same_node}
+logreg_model <- glm(
+  logreg_pred ~ rank +
+    stim_count_for_stim_neuron +
+    inv_dist +
+    same_node +
+    has_path,
+  data = model_df_bin,
+  family = binomial(link = "logit")
+)
+
+# View model summary
+summary(logreg_model)
+
+# Predict probabilities for the positive class
+predicted_prob <- predict(logreg_model, type = "response")
+# Create the ROC curve
+roc_curve <- roc(model_df_bin$logreg_pred, predicted_prob)
+# Plot the ROC curve
+plot(roc_curve, main = "ROC Curve", col = "blue", lwd = 2)
+# Calculate and display AUC
+auc(roc_curve)
+```
+```{r glm with whether stim neuron had detected response}
+# Fit logistic regression
+logreg_model <- glm(
+  logreg_pred ~ rank +
+    stim_count_for_stim_neuron +
+    inv_dist +
+    same_node +
+    has_path +
+    stim_self_responded,
+  data = model_df_bin,
+  family = binomial(link = "logit")
+)
+
+# View model summary
+summary(logreg_model)
+
+# Predict probabilities for the positive class
+predicted_prob <- predict(logreg_model, type = "response")
+# Create the ROC curve
+roc_curve <- roc(model_df_bin$logreg_pred, predicted_prob)
+# Plot the ROC curve
+plot(roc_curve, main = "ROC Curve", col = "blue", lwd = 2)
+# Calculate and display AUC
+auc(roc_curve)
+```
+```{r compute list of neurons that had detectable response in the past s seconds}
+# this idea is too slow because it computes rowwise
+# model_df_bin <- model_df_bin %>%
+#   rowwise() %>%
+#   mutate(
+#     relation_to_historical_response_60s = {
+#       # Identify past rows for the same worm
+#       past_rows <- model_df_bin %>%
+#         filter(
+#           worm == cur_data()$worm,
+#           logreg_pred == 1,
+#           vol < cur_data()$vol,
+#           (cur_data()$vol - vol) < 80
+#         )
+# 
+#       past_neurons <- past_rows$recorded_neuron
+#       current_neuron <- cur_data()$recorded_neuron
+# 
+#       if (length(past_neurons) == 0) {
+#         0
+#       } else {
+#         # Compute path lengths using your safe_dist_vec
+#         pls <- safe_dist_vec(past_neurons, current_neuron)
+# 
+#         # Sum inverse path lengths, ignoring NA and zero
+#         sum(ifelse(is.finite(pls) & pls > 0, 1 / pls, 0))
+#       }
+#     }
+#   ) %>%
+#   ungroup()
+
+dt <- as.data.table(model_df_bin)
+setorder(dt, worm, vol)  # ensure chronological order within worm
+
+# Pre-split path-length calculation into a function that accepts vectors
+inv_path_sum <- function(past_neurons, current_neuron) {
+  pls <- safe_dist_vec(past_neurons, current_neuron)
+  sum(ifelse(is.finite(pls) & pls > 0, 1/pls, 0))
+}
+
+dt[, relation_to_historical_response_30s := {
+  out <- numeric(.N)
+  for (i in seq_len(.N)) {
+    # restrict to last 80 half-seconds
+    idx <- which(vol < vol[i] & (vol[i] - vol) < 80 & logreg_pred == 1)
+    if (length(idx) > 0) {
+      out[i] <- inv_path_sum(recorded_neuron[idx], recorded_neuron[i])
+    }
+  }
+  out
+}, by = worm]
+
+model_df_bin <- as.data.frame(dt)
+```
+```{r glm with response history in past 40s (1 stim event before with some leeway)}
+# Fit logistic regression
+logreg_model <- glm(
+  logreg_pred ~ rank +
+    stim_count_for_stim_neuron +
+    inv_dist +
+    same_node +
+    has_path +
+    stim_self_responded +
+    relation_to_historical_response_30s,
+  data = model_df_bin,
+  family = binomial(link = "logit")
+)
+
+# View model summary
+summary(logreg_model)
+
+# Predict probabilities for the positive class
+predicted_prob <- predict(logreg_model, type = "response")
+# Create the ROC curve
+roc_curve <- roc(model_df_bin$logreg_pred, predicted_prob)
+# Plot the ROC curve
+plot(roc_curve, main = "ROC Curve", col = "blue", lwd = 2)
+# Calculate and display AUC
+auc(roc_curve)
+```
+```{r integrating neuropeptide connectome}
+# Take this file from https://github.com/LidiaRipollSanchez/Neuropeptide-Connectome.git
+neuropeptidergic_connectome <- read.csv("../connectome/01022024_neuropeptide_connectome_mid_range_model.csv",
+                                        row.names = 1,
+                                        check.names = FALSE)
+
+# Convert dataframe to matrix
+np_mat <- as.matrix(neuropeptidergic_connectome)
+
+# Build a directed graph. Weighted edges come from the matrix entries.
+g_np <- graph_from_adjacency_matrix(
+  np_mat,
+  mode = "directed",
+  weighted = TRUE,
+  diag = FALSE
+)
+
+# Directed shortest-path distances
+dist_mat <- igraph::distances(
+  g_all,
+  mode = "in",      # from post → pre direction
+  weights = NA       # treat all edges as unweighted; set weights=edge weights if desired
+)
+
+safe_dist <- function(stim, rec, dist_mat) {
+  # If either neuron missing → return NA
+  if (!(stim %in% rownames(dist_mat)) || !(rec %in% colnames(dist_mat))) {
+    return(NA_real_)
+  }
+  
+  d <- dist_mat[stim, rec]
+  if (!is.finite(d)) return(NA_real_)  # unreachable
+  return(d)
+}
+
+safe_dist_vec <- Vectorize(function(a, b) safe_dist(a, b, dist_mat))
+
+model_df_bin <- model_df_bin %>%
+  mutate(
+    np_connectome_path_length =
+      safe_dist_vec(stim_neuron, recorded_neuron),
+    has_np_path = !is.na(np_connectome_path_length)
+  )
+
+model_df_bin <- model_df_bin %>%
+  mutate(
+    np_connectome_path_length =
+      safe_dist_vec(stim_neuron, recorded_neuron),
+
+    np_same_node = ifelse(
+      !is.na(np_connectome_path_length) & np_connectome_path_length == 0,
+      1, 0
+    ),
+
+    np_inv_dist = ifelse(
+      !is.na(np_connectome_path_length) & np_connectome_path_length > 0,
+      1 / np_connectome_path_length,
+      0
+    )
+  )
+```
+```{r}
+# Fit logistic regression
+logreg_model <- glm(
+  logreg_pred ~ rank +
+    stim_count_for_stim_neuron +
+    inv_dist +
+    same_node +
+    has_path +
+    stim_self_responded +
+    relation_to_historical_response_30s +
+    np_inv_dist +
+    has_np_path,
+  data = model_df_bin,
+  family = binomial(link = "logit")
+)
+
+# View model summary
+summary(logreg_model)
+
+# Predict probabilities for the positive class
+predicted_prob <- predict(logreg_model, type = "response")
+# Create the ROC curve
+roc_curve <- roc(model_df_bin$logreg_pred, predicted_prob)
+# Plot the ROC curve
+plot(roc_curve, main = "ROC Curve", col = "blue", lwd = 2)
+# Calculate and display AUC
+auc(roc_curve)
+```
+
+```{r trying to compute SHAP. can do for a single row, but this R method takes too long for full observations}
+library(iml)
+
+X <- model_df_bin[, setdiff(names(model_df_bin), "logreg_pred")]
+y <- model_df_bin$logreg_pred
+
+predictor <- Predictor$new(
+  model = logreg_model,
+  data = X,
+  y = y,
+  predict.fun = function(model, newdata) {
+    predict(model, newdata, type = "response")
+  }
+)
+
+all_sh <- lapply(seq_len(nrow(X)), function(i) {
+  Shapley$new(predictor, x = X[i, , drop = FALSE])
+})
+
+```
 
 
 # Plotting Functions

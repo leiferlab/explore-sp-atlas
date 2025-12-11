@@ -768,7 +768,7 @@ self_response %>%
 # Strangely, glm on rank still has a positive coefficient
 # Fit logistic regression
 logreg_model <- glm(
-  logreg_pred ~ rank,
+  logreg_pred ~ rank + same_node,
   data = model_df_bin,
   family = binomial(link = "logit")
 )
@@ -1025,6 +1025,34 @@ plot(roc_curve, main = "ROC Curve", col = "blue", lwd = 2)
 # Calculate and display AUC
 auc(roc_curve)
 ```
+```{r}
+# Fit logistic regression
+logreg_model <- glm(
+  logreg_pred ~ rank +
+    stim_count_for_stim_neuron +
+    inv_dist +
+    same_node +
+    has_path +
+    stim_self_responded +
+    relation_to_historical_response_30s +
+    np_inv_dist +
+    has_np_path,
+  data = model_df_bin,
+  family = binomial(link = "logit")
+)
+
+# View model summary
+summary(logreg_model)
+
+# Predict probabilities for the positive class
+predicted_prob <- predict(logreg_model, type = "response")
+# Create the ROC curve
+roc_curve <- roc(model_df_bin$logreg_pred, predicted_prob)
+# Calculate and display AUC
+auc(roc_curve)
+```
+
+
 
 ```{r trying to compute SHAP. can do for a single row, but this R method takes too long for full observations}
 library(iml)

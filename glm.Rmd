@@ -1,0 +1,962 @@
+---
+title: "GLM with Train/Val/Test"
+author: "Bryan Chang"
+date: "2025-12-05"
+output: html_document
+---
+# Load packages
+```{r setup, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(pROC)
+```
+# Plotting fn
+```{r}
+#' Plots the gcamp response to a stimulation
+#' 
+#' Plots the time series of a neuron's gcamp before and after a stimulation.
+#' 
+#' @param worm_ind The worm index (character)
+#' @param vol The volume number of the stimulation
+#' @param neuron The neuron label whose response we want to plot
+#' @param sec_before The number of seconds before the stimulation to plot
+#' @param sec_after The number of seconds after the stimulation to plot
+#' @param use_lm Logical. If TRUE, fits an interrupted time series model. If FALSE, plots means.
+#' @param sec_before_fit The number of seconds before the stimulation to use for fitting (defaults to sec_before)
+#' @param sec_after_fit The number of seconds after the stimulation to use for fitting (defaults to sec_after)
+#' 
+#' @return A ggplot object
+plot_stim_response <- function(
+    worm_ind, 
+    vol, 
+    neuron, 
+    sec_before = 30, 
+    sec_after = 30, 
+    use_lm = FALSE, 
+    sec_before_fit = NULL, 
+    sec_after_fit = NULL
+) {
+  # Set default fitting windows
+  if (is.null(sec_before_fit)) sec_before_fit <- sec_before
+  if (is.null(sec_after_fit)) sec_after_fit <- sec_after
+  
+  # Desired window of volume indices
+  desired_vols <- seq(vol - 2 * sec_before, vol + 2 * sec_after)
+  
+  # Valid index range for this worm
+  max_vol <- nrow(gcamps[[worm_ind]])
+  
+  # Clip to valid indices
+  valid_vols <- desired_vols[desired_vols >= 1 & desired_vols <= max_vol]
+  
+  if (length(valid_vols) == 0) {
+    stop(str_glue("No valid volumes for worm {worm_ind}, vol {vol}."))
+  }
+  
+  # Full time axis (one per desired volume)
+  times_full <- seq(-sec_before, sec_after, length.out = length(desired_vols))
+  
+  # Time axis corresponding only to valid volumes
+  times <- times_full[desired_vols %in% valid_vols]
+  
+  # Extract gcamp
+  gc <- gcamps[[worm_ind]][valid_vols, neuron]
+  
+  df <- tibble(times = times, gc = gc)
+  
+  # Define before/after sets safely
+  before_idx <- which(df$times < 0)
+  after_idx  <- which(df$times > 0)
+  
+  # Fit model if requested
+  if (use_lm) {
+    df_fit <- df %>% 
+      filter(times >= -sec_before_fit & times <= sec_after_fit)
+    
+    if (nrow(df_fit) < 3) {
+      warning("Not enough points to fit lm; skipping.")
+    } else {
+      fit <- lm(gc ~ times + pmax(times, 0) + I(times > 0), data = df_fit)
+      df$fitted <- predict(fit, newdata = df)
+    }
+  }
+  
+  # Base plot
+  p <- ggplot(df, aes(x = times, y = gc)) +
+    geom_line() +
+    geom_point() +
+    geom_vline(xintercept = 0) +
+    labs(x = "Time since stimulation (s)",
+         y = "raw gcamp",
+         title = str_glue("Worm {worm_ind}, neuron {neuron} response to vol {vol}"))
+  
+  if (use_lm && "fitted" %in% names(df)) {
+    # Add fitted line
+    p <- p + geom_line(aes(y = fitted), color = "blue", linewidth = 1)
+    
+  } else {
+    # Mean segments (only if both sides have data)
+    if (length(before_idx) > 1) {
+      p <- p + geom_segment(
+        aes(x    = min(df$times[before_idx]),
+            xend = max(df$times[before_idx]),
+            y    = mean(df$gc[before_idx]),
+            yend = mean(df$gc[before_idx]))
+      )
+    }
+    if (length(after_idx) > 1) {
+      p <- p + geom_segment(
+        aes(x    = min(df$times[after_idx]),
+            xend = max(df$times[after_idx]),
+            y    = mean(df$gc[after_idx]),
+            yend = mean(df$gc[after_idx]))
+      )
+    }
+  }
+  
+  p
+}
+```
+
+
+# Load data
+Download the folder raw_extracted_data from https://osf.io/e2syt/files
+```text
+ll/
+├── explore-sp-atlas
+│   └── glm.Rmd
+└── raw_extracted_data
+```
+```{r load data}
+# generate worm indices vector
+worm_indices <- fs::dir_ls(path = "../raw_extracted_data") %>% # get files in raw_extracted_data
+  str_subset("stim_neurons.txt") %>% # keep files including "stim_neurons.txt"
+  str_extract("(\\d+)") %>% # extract worm indices
+  as.numeric() %>% # convert worm indices from character to numeric
+  sort() # sort worm indices
+
+# ensure worm indices are 0, 1, 2, ...
+stopifnot(all(worm_indices == seq(0, length(worm_indices) - 1)))
+
+# load stimulation events
+stims <- worm_indices %>% 
+  map(~ {
+    stim_neuron_file <- str_glue("../raw_extracted_data/{.x}_stim_neurons.txt")
+    labels_file <- str_glue("../raw_extracted_data/{.x}_labels.txt")
+    vols_file <- str_glue("../raw_extracted_data/{.x}_stim_volume_i.txt")
+    labels <- readLines(labels_file)
+    dat <- tibble(
+      vol = as.numeric(readLines(vols_file)) + 1,
+      neuron_indices = as.numeric(readLines(stim_neuron_file))
+    ) %>% 
+      mutate(
+        neuron_indices = if_else(neuron_indices < 0,
+                                 neuron_indices,
+                                 neuron_indices + 1) # increment neuron indices to use 1 indexing
+      )
+    dat$neuron <- rep(NA, nrow(dat))
+    ii <- dat$neuron_indices
+    dat$neuron[ii > 0] <- labels[ii[ii > 0]] # give names to stimulated neurons
+    return(dat)
+  })
+
+names(stims) <- worm_indices
+# merge list of tibbles into a single tibble
+stim_events <- stims %>% bind_rows(.id = "worm")
+```
+```{r load gcamp recordings, message=FALSE}
+# load gcamp recordings
+gcamps <- worm_indices %>% map(~ {
+  gcamp <- read_delim(str_glue("../raw_extracted_data/{.x}_gcamp.txt"),
+                      delim = " ", col_names = FALSE)
+  times <- readr::read_csv(str_glue("../raw_extracted_data/{.x}_t.txt"),
+                           col_names = FALSE)[[1]]
+  labels <- readLines(str_glue("../raw_extracted_data/{.x}_labels.txt"))
+  ii_nolabels <- which(labels %in% c("", " "))
+  labels[ii_nolabels] <- str_glue("w{.x}_{ii_nolabels}")
+  
+  if (ncol(gcamp) != length(labels)) {
+    cat(str_glue("Worm {.x} has {length(labels)} labels but {ncol(gcamp)} gcamp columns."), fill = TRUE)
+    return(NA)
+  }
+  
+  gcamp <- as.matrix(gcamp)
+  rownames(gcamp) <- times
+  colnames(gcamp) <- labels
+  gcamp
+})
+
+names(gcamps) <- worm_indices
+
+# average repeated neurons and remove merge/target neurons
+gcamps <- worm_indices %>%
+  as.character() %>%
+  map(~ {
+    ii_keep <- which(!str_detect(colnames(gcamps[[.x]]), "^merge|^target"))
+    gcamps[[.x]] <- gcamps[[.x]][, ii_keep]
+    repeated <- gcamps[[.x]] %>%
+      colnames() %>%
+      table() %>%
+      as_tibble() %>%
+      set_names(c("neuron", "n")) %>%
+      filter(n > 1) %>%
+      pull(neuron)
+    
+    for (neur in repeated) {
+      ii <- which(colnames(gcamps[[.x]]) == neur)
+      gcamps[[.x]][, ii[1]] <- rowMeans(gcamps[[.x]][, ii], na.rm = TRUE)
+      gcamps[[.x]] <- gcamps[[.x]][, -ii[-1]]
+    }
+    return(gcamps[[.x]])
+  }) %>% 
+  set_names(worm_indices)
+```
+```{r set aside worms for testing and validation}
+set.seed(42)
+# proportion of worms
+p_train <- 0.8 * 0.8
+p_val   <- 0.8 * 0.2
+p_test  <- 0.2
+
+# shuffle worms
+worms_shuffled <- sample(worm_indices)
+
+n <- length(worms_shuffled)
+n_train <- floor(p_train * n)
+n_val   <- floor(p_val   * n)
+n_test  <- n - n_train - n_val
+
+train_worms <- worms_shuffled[1:n_train]
+val_worms   <- worms_shuffled[(n_train+1):(n_train+n_val)]
+test_worms  <- worms_shuffled[(n_train+n_val+1):n]
+
+train_idx <- worm_indices %in% train_worms
+val_idx   <- worm_indices %in% val_worms
+test_idx  <- worm_indices %in% test_worms
+```
+# Wilcoxon Rank-Sum Test
+```{r wilcoxon_test}
+TIME_BEFORE <- 20 # 20 vols is equivalent to 10 seconds
+TIME_AFTER <- 60
+
+stim_events <- stim_events %>%
+  mutate(wilcox_pvals = map2(worm, vol, ~ { # for each row, get worm and vol
+    worm_ind <- .x
+    vol <- .y
+    vols_before <- seq(vol - TIME_BEFORE, vol - 1) # calculate window before stim
+    vols_after <- seq(vol + 1, vol + TIME_AFTER) # calculate window after stim
+    
+    # skip edge cases
+    if (all(is.na(gcamps[[worm_ind]]))) {
+      cat(str_glue("Worm {worm_ind} is NA."), fill = TRUE)
+      return(NA)
+    }
+    
+    if (min(vols_before) < 1 || max(vols_after) > nrow(gcamps[[worm_ind]])) {
+      cat(str_glue("Skip: Stim too close to recording boundary."), fill = TRUE)
+      return(NA)
+    }
+    
+    gc_before <- gcamps[[worm_ind]][vols_before, , drop = FALSE]
+    gc_after <- gcamps[[worm_ind]][vols_after, , drop = FALSE]
+    
+    pvals <- sapply(seq_len(ncol(gc_before)), function(i) {
+      x_before <- gc_before[, i]
+      x_after <- gc_after[, i]
+      
+      tryCatch({
+        test <- wilcox.test(x_before, x_after, alternative = "less")
+        test$p.value
+      }, error = function(e) NA)
+    })
+    
+    list(pvals)
+  }))
+```
+# Acquire features (mean and slope before and after stim) for logistic regression response detector
+```{r calculate_features}
+TIME_BEFORE_F <-60
+TIME_AFTER_F <- 60
+TIME_BEFORE_SLOPE <- 20
+TIME_AFTER_SLOPE <- 20
+
+stim_events <- stim_events %>%
+  rowwise() %>%
+  mutate(
+    F0 = {
+      worm_data <- gcamps[[as.character(worm)]]
+      stim_vol <- vol
+      neuron_names <- colnames(worm_data)
+      
+      if (stim_vol <= 1) return(list(setNames(numeric(), character())))
+      
+      vols_before <- seq_len(stim_vol - 1)
+      if (stim_vol > TIME_BEFORE_F) vols_before <- (stim_vol - TIME_BEFORE_F):(stim_vol - 1)
+      
+      f0_vals <- sapply(neuron_names, function(nrn) {
+        mean(worm_data[vols_before, nrn], na.rm = TRUE)
+      })
+      
+      list(f0_vals)
+    },
+    
+    F = {
+      worm_data <- gcamps[[as.character(worm)]]
+      stim_vol <- vol
+      neuron_names <- colnames(worm_data)
+      total_vols <- nrow(worm_data)
+      
+      vols_after <- (stim_vol + 1):(stim_vol + TIME_AFTER_F)
+      vols_after <- vols_after[vols_after <= total_vols]
+      
+      if (length(vols_after) == 0) { # can't get mean of 0 points
+        return(list(setNames(rep(NA_real_, length(neuron_names)), neuron_names)))
+      }
+      
+      f_vals <- sapply(neuron_names, function(nrn) {
+        mean(worm_data[vols_after, nrn], na.rm = TRUE)
+      })
+      
+      list(f_vals)
+    },
+    
+    dFF = {
+      f0_vec <- F0
+      f_vec <- F
+      dff_vals <- (f_vec - f0_vec) / f0_vec
+      list(dff_vals)
+    },
+    
+    slope_before = {
+      worm_data <- gcamps[[as.character(worm)]]
+      stim_vol <- vol
+      neuron_names <- colnames(worm_data)
+      times <- as.numeric(rownames(worm_data))
+      
+      vols_before <- (stim_vol - TIME_BEFORE_SLOPE):(stim_vol - 1)
+      vols_before <- vols_before[vols_before > 0]
+      
+      if (length(vols_before) < 2) {
+        return(list(setNames(rep(NA_real_, length(neuron_names)), neuron_names)))
+      }
+      
+      slope_vals <- sapply(neuron_names, function(nrn) {
+        y <- worm_data[vols_before, nrn]
+        x <- times[vols_before]
+        valid <- !is.na(y)
+        if (sum(valid) < 2) return(NA_real_) # can't get slope of <2 points
+        
+        fit <- lm(y[valid] ~ x[valid])
+        coef(fit)[2]
+      })
+      
+      list(slope_vals)
+    },
+    
+    slope_after = {
+      worm_data <- gcamps[[as.character(worm)]]
+      stim_vol <- vol
+      neuron_names <- colnames(worm_data)
+      times <- as.numeric(rownames(worm_data))
+      total_vols <- nrow(worm_data)
+      
+      vols_after <- (stim_vol + 1):(stim_vol + TIME_AFTER_SLOPE)
+      vols_after <- vols_after[vols_after <= total_vols]
+      
+      if (length(vols_after) < 2) {
+        return(list(setNames(rep(NA_real_, length(neuron_names)), neuron_names)))
+      }
+      
+      slope_vals <- sapply(neuron_names, function(nrn) {
+        y <- worm_data[vols_after, nrn]
+        x <- times[vols_after]
+        valid <- !is.na(y)
+        if (sum(valid) < 2) return(NA_real_)
+        
+        fit <- lm(y[valid] ~ x[valid])
+        coef(fit)[2]
+      })
+      
+      list(slope_vals)
+    }
+  ) %>%
+  ungroup()
+```
+
+Let's make a feature "rank" that records the number of stimulations have occurred prior to the current one for this worm:
+```{r rank feature}
+stim_events <- stim_events %>% 
+  group_by(worm) %>% 
+  mutate(rank = rank(vol) - 1) %>% 
+  ungroup()
+```
+And "stim_rank" that records number of stimulations of itself prior to the current one for this worm:
+```{r stim_rank feature}
+stim_events <- stim_events %>%
+  group_by(worm, neuron) %>%
+  arrange(vol) %>%
+  mutate(stim_rank = row_number() - 1) %>%
+  ungroup()
+```
+# Boolean indicates whether there are gaps
+```{r}
+TIME_BEFORE <- 60
+TIME_AFTER <- 60
+MAX_CONSECUTIVE_NAS <- 2
+stim_events <- stim_events %>%
+  mutate(has_no_gaps = map2(worm, vol, ~ {
+    worm_ind <- .x
+    vol      <- .y
+
+    vols_before <- seq(vol - TIME_BEFORE, vol - 1)
+    vols_after  <- seq(vol + 1, vol + TIME_AFTER)
+
+    if (all(is.na(gcamps[[worm_ind]]))) return(NA)
+    if (min(vols_before) < 1 || max(vols_after) > nrow(gcamps[[worm_ind]])) return(NA)
+
+    gc_before <- gcamps[[worm_ind]][vols_before, , drop = FALSE]
+    gc_after  <- gcamps[[worm_ind]][vols_after,  , drop = FALSE]
+
+    sapply(seq_len(ncol(gc_before)), function(i) {
+      x_before <- gc_before[, i]
+      x_after  <- gc_after[,  i]
+
+      rle_before <- rle(is.na(x_before))
+      rle_after  <- rle(is.na(x_after))
+
+      ok_before <- !any(rle_before$values & rle_before$lengths >= MAX_CONSECUTIVE_NAS)
+      ok_after  <- !any(rle_after$values  & rle_after$lengths  >= MAX_CONSECUTIVE_NAS)
+
+      ok_before && ok_after
+    })
+  }))
+```
+# Expand stim events to long format
+```{r expand_to_long}
+stim_events_long <- stim_events %>%
+  mutate(event_id = row_number()) %>%
+  transmute(
+    event_id,
+    worm,
+    vol,
+    stim_neuron = neuron,
+    rank,
+    stim_rank,
+    neuron_indices,
+    data = pmap(list(F0, F, dFF, slope_before, slope_after, 
+                     wilcox_pvals, has_no_gaps), 
+                function(f0, f, dff, sb, sa, wp, g) {
+      tibble(
+        recorded_neuron = names(f0),
+        F0 = unname(f0),
+        F = unname(f),
+        dFF = unname(dff),
+        slope_before = unname(sb),
+        slope_after = unname(sa),
+        wilcox_pval = if(!is.null(wp) && length(wp) > 0) unname(wp[[1]]) else NA,
+        has_no_gaps = unname(g)
+      )
+    })
+  ) %>%
+  unnest(data)
+```
+
+```{r add train/test/val splits}
+stim_events_long <- stim_events_long %>%
+  mutate(split = case_when(
+    worm %in% train_worms ~ "train",
+    worm %in% val_worms   ~ "val",
+    worm %in% test_worms  ~ "test",
+    TRUE                  ~ NA_character_
+  ))
+```
+
+# Train Binomial Logistic Regression
+```text
+ll/
+├── explore-sp-atlas
+│   └── glm.Rmd
+└── rdata/gt-table.Rdata
+```
+```{r train response detector}
+load("../rdata/gt-table.Rdata")  # ground-truth labels
+
+# Merge stim_events_long with ground-truth labels
+training_data <- stim_events_long %>%
+  left_join(
+    gt_table %>% select(worm, vol, recorded_neuron, label),
+    by = c("worm", "vol", "recorded_neuron")
+  ) %>%
+  filter(
+    !is.na(dFF), !is.na(slope_before), !is.na(slope_after),
+    is.finite(dFF), is.finite(slope_before), is.finite(slope_after)
+  )
+
+# Keep only 0/1 labels
+# -1 labels are negative responses
+labeled_data <- training_data %>%
+  filter(label %in% c(0, 1)) %>%
+  mutate(label = factor(label, levels = c(0, 1)))
+
+# Split: train = model fitting, val = test data, test = use later
+train_set <- labeled_data %>% filter(split == "train")
+val_set   <- labeled_data %>% filter(split == "val")
+# test_set <- labeled_data %>% filter(split == "test")   # will use later
+
+# marker so we know which rows were used for fitting
+train_set_marker <- train_set %>%
+  select(worm, vol, recorded_neuron) %>%
+  mutate(in_train = TRUE)
+
+# Fit logistic regression on training data
+binary_model <- glm(
+  label ~ dFF + slope_before + slope_after,
+  data   = train_set,
+  family = binomial()
+)
+
+# Predict probabilities for all rows
+training_data <- training_data %>%
+  mutate(
+    logreg_prob = predict(binary_model, newdata = ., type = "response"),
+    logreg_pred = ifelse(logreg_prob > 0.5, 1, 0)
+  )
+
+# Compute quantile thresholds
+q_lo <- quantile(training_data$logreg_prob, 0.05, na.rm = TRUE)
+q_hi <- quantile(training_data$logreg_prob, 0.95, na.rm = TRUE)
+
+training_data <- training_data %>%
+  mutate(
+    logreg_prob = predict(binary_model, newdata = ., type = "response"),
+    logreg_pred = ifelse(logreg_prob > 0.5, 1, 0),
+
+    logreg_extreme = case_when(
+      logreg_prob < q_lo ~ 0,
+      logreg_prob > q_hi ~ 1,
+      TRUE ~ NA_real_
+    )
+  )
+
+
+# Mark rows that were part of labeled training data
+training_data <- training_data %>%
+  left_join(train_set_marker,
+            by = c("worm", "vol", "recorded_neuron")) %>%
+  mutate(in_train = replace_na(in_train, FALSE))
+
+cat(str_glue("Total rows in training_data: {nrow(training_data)}\n\n"))
+n_in_train <- sum(training_data$in_train)
+cat(str_glue("Number of samples used for training: {n_in_train}\n"))
+```
+
+```{r Are stimulated neurons likely to be recorded as responding?}
+training_data %>%
+  group_by(split) %>%        # split = "train", "val", "test"
+  summarize(
+    frac_same = mean(logreg_pred[stim_neuron == recorded_neuron], na.rm = TRUE),
+    frac_diff = mean(logreg_pred[stim_neuron != recorded_neuron], na.rm = TRUE)
+  ) %>%
+  filter(split %in% c("train", "val"))
+```
+
+```{r plot those with extreme p-vals}
+# Sample a few highs and lows
+extreme_1 <- training_data %>% 
+  filter(logreg_extreme == 1) %>% 
+  slice_head(n = 5)
+
+extreme_0 <- training_data %>% 
+  filter(logreg_extreme == 0) %>% 
+  slice_head(n = 5)
+
+# Plot function wrapper for convenience
+plot_example <- function(row) {
+  plot_stim_response(
+    worm_ind = row$worm,
+    vol      = row$vol,
+    neuron   = row$recorded_neuron,   # adjust if you want stim_neuron instead
+    sec_before = 20,
+    sec_after  = 20,
+    use_lm = TRUE                     # or FALSE if you prefer the mean-segment version
+  )
+}
+
+# Generate lists of plots
+plots_extreme_1 <- purrr::map(split(extreme_1, seq_len(nrow(extreme_1))), plot_example)
+plots_extreme_0 <- purrr::map(split(extreme_0, seq_len(nrow(extreme_0))), plot_example)
+```
+
+```{r noticed that the p-vals close to 1 tend to be negative responses}
+plots_extreme_1[[4]]
+plots_extreme_0[[5]]
+```
+
+
+
+# Get connectome features
+```{r get connectome graphs}
+# 1. Load base anatomical connectome
+connectome <- read_delim("../connectome/aconnectome_witvliet_2020_8.csv")
+
+# 2. Chemical connectome (directed)
+chem_edges <- connectome %>% 
+  filter(type == "chemical") %>%
+  select(pre, post, synapses)
+
+g_chem <- graph_from_data_frame(
+  chem_edges,
+  directed = TRUE
+)
+
+dist_chem <- distances(
+  g_chem,
+  mode = "out",
+  weights = NA   # unweighted shortest paths
+)
+
+# 3. Electrical connectome (undirected)
+elec_edges <- connectome %>% 
+  filter(type == "electrical") %>%
+  select(pre, post, synapses)
+
+g_elec <- graph_from_data_frame(
+  elec_edges,
+  directed = FALSE
+)
+
+dist_elec <- distances(
+  g_elec,
+  mode = "out",
+  weights = NA
+)
+
+# 4. Neuropeptidergic connectome
+np_df <- read.csv(
+  "../connectome/01022024_neuropeptide_connectome_mid_range_model.csv",
+  row.names = 1,
+  check.names = FALSE
+)
+
+np_mat <- as.matrix(np_df)
+
+g_np <- graph_from_adjacency_matrix(
+  np_mat,
+  mode = "directed",
+  weighted = NULL,
+  diag = FALSE
+)
+
+dist_np <- distances(
+  g_np,
+  mode = "out",
+  weights = NA
+)
+
+# 5. Safe distance utilities (separate per connectome)
+safe_dist_single <- function(mat) {
+  # Returns a function stim, rec -> distance
+  function(stim, rec) {
+    if (!(stim %in% rownames(mat)) || !(rec %in% colnames(mat))) {
+      return(NA_real_)
+    }
+    d <- mat[stim, rec]
+    if (!is.finite(d)) return(NA_real_)
+    d
+  }
+}
+
+# Build graph-specific safe distance functions
+safe_dist_chem  <- safe_dist_single(dist_chem)
+safe_dist_elec  <- safe_dist_single(dist_elec)
+safe_dist_np    <- safe_dist_single(dist_np)
+
+# Vectorized versions for dplyr
+safe_dist_vec_chem <- Vectorize(safe_dist_chem)
+safe_dist_vec_elec <- Vectorize(safe_dist_elec)
+safe_dist_vec_np   <- Vectorize(safe_dist_np)
+```
+# Predict the binary response using a GLM
+```{r create df for glm model with binary classes}
+# Compute response of each stim neuron to itself
+self_response <- training_data %>%
+  filter(stim_neuron == recorded_neuron) %>%
+  group_by(stim_neuron, worm, vol) %>%
+  summarize(
+    stim_self_responded = as.integer(any(logreg_pred == 1, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+model_df_bin <- training_data %>%
+  left_join(self_response,
+            by = c("stim_neuron", "worm", "vol")) %>%
+  filter(
+    !is.na(stim_neuron),
+    stim_neuron != "",
+    !grepl("^\\s*$", stim_neuron)    # catches whitespace-only
+  ) %>%
+  mutate(
+    # stim_neuron never had a self-recording row for that worm+vol
+    stim_self_responded = replace_na(stim_self_responded, 0)
+  ) %>%
+  mutate(
+    wilcox_pred = as.integer(wilcox_pval < 0.05)
+  ) %>%
+  transmute(
+    rank,
+    stim_rank,
+    logreg_pred = as.factor(logreg_pred),
+    logreg_extreme = as.factor(logreg_extreme),
+    wilcox_pred = as.factor(wilcox_pred),
+    stim_self_responded,
+    stim_neuron,
+    recorded_neuron,
+    worm,
+    vol,
+    split,
+  ) %>%
+  filter(!is.na(logreg_pred))
+
+model_df_bin <- model_df_bin %>%
+  mutate(
+    is_self = as.integer(stim_neuron == recorded_neuron),
+    
+    dist_chem  = safe_dist_vec_chem(stim_neuron, recorded_neuron),
+    dist_elec  = safe_dist_vec_elec(stim_neuron, recorded_neuron),
+    dist_np    = safe_dist_vec_np(stim_neuron, recorded_neuron),
+
+    inv_dist_chem = if_else(is.finite(dist_chem) & dist_chem > 0,
+                            1 / dist_chem,
+                            0),
+
+    inv_dist_elec = if_else(is.finite(dist_elec) & dist_elec > 0,
+                            1 / dist_elec,
+                            0),
+
+    inv_dist_np   = if_else(is.finite(dist_np) & dist_np > 0,
+                            1 / dist_np,
+                            0)
+  )
+
+
+# Compute the constructed heuristic for residual past stimulations
+inv_path_sum_generic <- function(past_neurons, current_neuron, safe_fun) {
+  d <- safe_fun(past_neurons, current_neuron)
+  sum(ifelse(is.finite(d) & d > 0, 1/d, 0))
+}
+
+dt <- as.data.table(model_df_bin)
+setorder(dt, worm, vol)
+
+dt[, c("hist_inv_chem_30s",
+       "hist_inv_elec_30s",
+       "hist_inv_np_30s") :=
+      {
+        n <- .N
+        out_chem <- numeric(n)
+        out_elec <- numeric(n)
+        out_np   <- numeric(n)
+
+        for (i in seq_len(n)) {
+          idx <- which(
+            vol < vol[i] &
+            (vol[i] - vol) < 80 &
+            logreg_pred == 1
+          )
+
+          if (length(idx) > 0) {
+            past <- recorded_neuron[idx]
+            cur  <- recorded_neuron[i]
+
+            out_chem[i] <- inv_path_sum_generic(past, cur, safe_dist_vec_chem)
+            out_elec[i] <- inv_path_sum_generic(past, cur, safe_dist_vec_elec)
+            out_np[i]   <- inv_path_sum_generic(past, cur, safe_dist_vec_np)
+          }
+        }
+
+        list(out_chem, out_elec, out_np)
+      },
+      by = worm
+]
+
+model_df_bin <- as.data.frame(dt)
+```
+
+```{r add reversed chemical conn}
+dist_chem_rev <- distances(g_chem, mode = "in", weights = NA)
+safe_dist_chem_rev <- safe_dist_single(dist_chem_rev)
+safe_dist_vec_chem_rev <- Vectorize(safe_dist_chem_rev)
+model_df_bin <- model_df_bin %>%
+  mutate(
+    dist_chem_rev = safe_dist_vec_chem_rev(recorded_neuron, stim_neuron),
+
+    inv_dist_chem_rev = if_else(
+      is.finite(dist_chem_rev) & dist_chem_rev > 0,
+      1 / dist_chem_rev,
+      0
+    )
+  )
+```
+```{r ...and history}
+dt[, c("hist_inv_chem_30s",
+       "hist_inv_elec_30s",
+       "hist_inv_np_30s",
+       "hist_inv_chem_rev_30s") :=
+      {
+        n <- .N
+        out_chem     <- numeric(n)
+        out_elec     <- numeric(n)
+        out_np       <- numeric(n)
+        out_chem_rev <- numeric(n)
+
+        for (i in seq_len(n)) {
+          idx <- which(
+            vol < vol[i] &
+            (vol[i] - vol) < 80 &
+            logreg_pred == 1
+          )
+
+          if (length(idx) > 0) {
+            past <- recorded_neuron[idx]
+            cur  <- recorded_neuron[i]
+
+            out_chem[i]     <- inv_path_sum_generic(past, cur, safe_dist_vec_chem)
+            out_elec[i]     <- inv_path_sum_generic(past, cur, safe_dist_vec_elec)
+            out_np[i]       <- inv_path_sum_generic(past, cur, safe_dist_vec_np)
+
+            # reversed chemical direction
+            out_chem_rev[i] <- inv_path_sum_generic(past, cur, safe_dist_vec_chem_rev)
+          }
+        }
+
+        list(out_chem, out_elec, out_np, out_chem_rev)
+      },
+      by = worm
+]
+model_df_bin <- as.data.frame(dt)
+```
+
+
+```{r wilcox, rank only}
+logreg_model <- glm(
+  wilcox_pred ~ rank + is_self,
+  data = model_df_bin %>% filter(split == "train"),
+  family = binomial(link = "logit")
+)
+
+model_df_bin$pred_prob <- predict(logreg_model, newdata = model_df_bin, type = "response")
+
+library(pROC)
+
+# Train ROC
+train_df <- model_df_bin %>% filter(split == "train")
+roc_train <- roc(train_df$logreg_pred, train_df$pred_prob)
+auc_train <- auc(roc_train)
+
+# Val ROC
+val_df <- model_df_bin %>% filter(split == "val")
+roc_val <- roc(val_df$logreg_pred, val_df$pred_prob)
+auc_val <- auc(roc_val)
+
+plot(roc_train, col = "blue",  lwd = 2, main = "ROC: Train vs Val")
+lines(roc_val, col = "red", lwd = 2)
+legend("bottomright",
+       legend = c(paste0("Train AUC = ", round(auc_train, 3)),
+                  paste0("Val AUC = ", round(auc_val, 3))),
+       col = c("blue", "red"),
+       lwd = 2)
+
+# View model summary
+summary(logreg_model)
+```
+```{r logreg, rank only}
+logreg_model <- glm(
+  logreg_pred ~ rank + is_self,
+  data = model_df_bin %>% filter(split == "train"),
+  family = binomial(link = "logit")
+)
+
+model_df_bin$pred_prob <- predict(logreg_model, newdata = model_df_bin, type = "response")
+
+library(pROC)
+
+# Train ROC
+train_df <- model_df_bin %>% filter(split == "train")
+roc_train <- roc(train_df$logreg_pred, train_df$pred_prob)
+auc_train <- auc(roc_train)
+
+# Val ROC
+val_df <- model_df_bin %>% filter(split == "val")
+roc_val <- roc(val_df$logreg_pred, val_df$pred_prob)
+auc_val <- auc(roc_val)
+
+plot(roc_train, col = "blue",  lwd = 2, main = "ROC: Train vs Val")
+lines(roc_val, col = "red", lwd = 2)
+legend("bottomright",
+       legend = c(paste0("Train AUC = ", round(auc_train, 3)),
+                  paste0("Val AUC = ", round(auc_val, 3))),
+       col = c("blue", "red"),
+       lwd = 2)
+
+# View model summary
+summary(logreg_model)
+```
+
+```{r marginal coefficients}
+features <- c("rank", "stim_rank", "is_self", "inv_dist_chem", "inv_dist_elec", "inv_dist_np",
+              "inv_dist_chem_rev",
+              "hist_inv_chem_30s", "hist_inv_elec_30s", "hist_inv_np_30s", "stim_self_responded",
+              "hist_inv_chem_rev_30s")
+
+marginal_auc <- function(df, feature) {
+  
+  # Special handling for stim_self_responded to exclude predicting the feature
+  if (feature == "stim_self_responded") {
+    df2 <- df %>% filter(stim_neuron != recorded_neuron)
+    if (nrow(df2) == 0) return(NA_real_)
+    return(auc(roc(df2$logreg_pred, df2[[feature]])))
+  }
+  
+  # Default case
+  auc(roc(df$logreg_pred, df[[feature]]))
+}
+
+train_df <- model_df_bin %>% filter(split == "train")
+val_df   <- model_df_bin %>% filter(split == "val")
+
+results <- tibble(
+  feature = features,
+  auc_train = map_dbl(features, ~ marginal_auc(train_df, .x)),
+  auc_val   = map_dbl(features, ~ marginal_auc(val_df,   .x))
+)
+
+print(results)
+
+marginal_auc_extreme <- function(df, feature) {
+  
+  # Exclude missing extreme labels
+  df_clean <- df %>% filter(!is.na(logreg_extreme))
+  if (nrow(df_clean) == 0) return(NA_real_)
+  
+  # Special-case for stim_self_responded: exclude stim = recorded
+  if (feature == "stim_self_responded") {
+    df2 <- df_clean %>% filter(stim_neuron != recorded_neuron)
+    if (nrow(df2) == 0) return(NA_real_)
+    return(auc(roc(df2$logreg_extreme, df2[[feature]])))
+  }
+  
+  # Default
+  auc(roc(df_clean$logreg_extreme, df_clean[[feature]]))
+}
+
+train_df_ext <- model_df_bin %>% filter(split == "train")
+val_df_ext   <- model_df_bin %>% filter(split == "val")
+
+results_extreme <- tibble(
+  feature   = features,
+  auc_train = map_dbl(features, ~ marginal_auc_extreme(train_df_ext, .x)),
+  auc_val   = map_dbl(features, ~ marginal_auc_extreme(val_df_ext,   .x))
+)
+
+print(results_extreme)
+```
+
